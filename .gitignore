@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# C / Build artifacts
+*.o
+*.obj
+*.so
+*.a
+
+# CodeQL / Static Analysis
+codeql-db/
+my-db/
+results.sarif
+.qlpack/
+
+# Script Outputs
+vulnerability_report.json
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Juliet Test Suite-C
+juliet-test-suite-c/
+target_bin
+
+#angr
+angr_harness.py
+poc.bin
+
+#tcpdump
+tcpdump-tcpdump-4.9.1/
+libpcap-libpcap-1.8.0/
+get_offsets.c
+
+#test
+test_mcp/
+test_fscanf/
