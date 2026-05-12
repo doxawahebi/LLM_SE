@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+celery
+redis
+tree-sitter
+tree-sitter-c
+angr
+google-genai
+pydantic
+cxxfilt
