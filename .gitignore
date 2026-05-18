@@ -43,3 +43,13 @@ get_offsets.c
 #test
 test_mcp/
 test_fscanf/
+
+.gdb_history
+.gdbinit
+
+CodeQLSlicer.py
+
+#klee
+klee_harness.c
+target.bc
+klee-out/
