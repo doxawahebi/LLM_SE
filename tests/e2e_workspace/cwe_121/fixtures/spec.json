@@ -1,0 +1,28 @@
+{
+  "rule_id": "local/cpp/cwe-120-overflow",
+  "cwe": "CWE-120",
+  "file": "/home/cks/Project/SE-LLM-project/tests/e2e_workspace/cwe_121/target.c",
+  "line": 5,
+  "col": 5,
+  "message": "Stack-based buffer overflow: memcpy called with input_len not bounded by sizeof(buf)",
+  "snippet": "memcpy(buf, input, input_len);   /* ← ℓ */",
+  "trace": [],
+  "suspect_calls": [
+    "memcpy"
+  ],
+  "pointer_vars": [],
+  "length_vars": [
+    "input_len"
+  ],
+  "bounds_hints": [
+    "include <string",
+    "h>\n\nstatic",
+    "17 > 16"
+  ],
+  "build_context": {
+    "include_paths": [],
+    "defines": []
+  },
+  "entrypoint": "vulnerable",
+  "assertion_template": "n <= min(len(dst), len(src))"
+}

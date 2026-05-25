@@ -1,6 +1,162 @@
-version: '3.8'
+# docker-compose.yml
+# Usage: docker compose up -d
+# All services start automatically. No manual setup required.
+
 services:
-  redis:
-    image: redis/redis-stack-server:latest
+
+  # ── Frontend ────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: ${FRONTEND_TARGET:-production}   # development | production
     ports:
-      - "6379:6379"
+      - "${FRONTEND_PORT:-3000}:80"
+    environment:
+      VITE_API_URL: http://backend:8000
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks: [sailor_net]
+    restart: unless-stopped
+
+  # ── Backend (FastAPI) ───────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    environment:
+      DATABASE_URL:          postgresql+asyncpg://sailor:${DB_PASSWORD}@postgres:5432/sailor
+      REDIS_URL:             redis://redis:6379/0
+      CELERY_BROKER_URL:     redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      S3_ENDPOINT:           http://minio:9000
+      S3_ACCESS_KEY:         ${MINIO_ROOT_USER}
+      S3_SECRET_KEY:         ${MINIO_ROOT_PASSWORD}
+      S3_BUCKET:             sailor-artifacts
+      JWT_SECRET:            ${JWT_SECRET}
+      ANTHROPIC_API_KEY:     ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_API_OPTION:  ${ANTHROPIC_API_OPTION:-false}
+      GEMINI_API_KEY:        ${GEMINI_API_KEY}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [sailor_net]
+    restart: unless-stopped
+
+  # ── Celery Worker ───────────────────────────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    environment:
+      CELERY_BROKER_URL:     redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      DATABASE_URL:          postgresql+asyncpg://sailor:${DB_PASSWORD}@postgres:5432/sailor
+      ANTHROPIC_API_KEY:     ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_API_OPTION:  ${ANTHROPIC_API_OPTION:-false}
+      GEMINI_API_KEY:        ${GEMINI_API_KEY}
+      OUTPUT_BASE:           /data/output
+      RUNNER_IMAGE:          sailor-runner:latest
+      RUNNER_NETWORK:        sailor_net
+    volumes:
+      - workspace_data:/data/workspace
+      - output_data:/data/output
+      - /var/run/docker.sock:/var/run/docker.sock   # spawn runner containers
+      - ./sailor/codeql/queries:/sailor-queries:ro  # custom CodeQL queries
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks: [sailor_net]
+    restart: unless-stopped
+
+  # ── Redis ───────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks: [sailor_net]
+    restart: unless-stopped
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB:       sailor
+      POSTGRES_USER:     sailor
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sailor"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks: [sailor_net]
+    restart: unless-stopped
+
+  # ── MinIO (S3-compatible artifact store) ───────────────────────────
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER:     ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"   # admin console
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [sailor_net]
+    restart: unless-stopped
+
+  # ── MinIO bucket init (runs once, exits) ──────────────────────────
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD};
+        mc mb --ignore-existing local/sailor-artifacts;
+        mc anonymous set none local/sailor-artifacts;
+        echo 'MinIO bucket ready.';
+      "
+    environment:
+      MINIO_ROOT_USER:     ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    networks: [sailor_net]
+
+volumes:
+  db_data:
+  redis_data:
+  minio_data:
+  workspace_data:
+  output_data:
+
+networks:
+  sailor_net:
+    driver: bridge

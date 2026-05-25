@@ -87,12 +87,20 @@ project_root/
 │
 ├── sailor/                      ← Pipeline package (imported by worker)
 │   └── infra/
-│       ├── docker_runner.py
-│       ├── celery_tasks.py
-│       └── celery_config.py
+│       ├── docker_runner.py     ← DockerRunner (all Phase execution)
+│       ├── celery_tasks.py      ← Evaluation-only tasks (EvaluationDB/CVERecord)
+│       └── celery_config.py     ← Evaluation-only Celery config
+│
+├── backend/                     ← FastAPI application + web-app Celery tasks
+│   ├── celery_app.py            ← Celery app for the web application
+│   └── tasks/
+│       ├── phase1.py            ← Web-app Phase 1 task (PostgreSQL ORM)
+│       ├── phase2.py            ← Web-app Phase 2 task (lease + heartbeat)
+│       ├── phase3.py            ← Web-app Phase 3 task (verdict persistence)
+│       └── exports.py           ← Tarball generation task
 │
 └── docker/
-    ├── Dockerfile.worker        ← Celery worker (sailor package)
+    ├── Dockerfile.worker        ← Celery worker (backend + sailor package)
     └── Dockerfile.runner        ← Phase execution (codeql + klee + clang)
 ```
 
@@ -182,17 +190,25 @@ class DockerRunner:
 
     # ── Target Setup ───────────────────────────────────────────────────
 
-    def setup_target(self, project_url: str, commit: str,
+    def setup_target(self, project_url: str | None, commit: str | None,
                      build_commands: list[str],
-                     dependencies: list[str]) -> Path:
+                     dependencies: list[str],
+                     local_source_path: str | None = None) -> Path:
         """
         Inside container:
           1. apt-get install dependencies
-          2. git clone + checkout commit
-          3. run build_commands (produces compile_commands.json via bear)
+          2. git clone + checkout commit  (OR docker cp from local_source_path)
+          3. run build_commands
         Returns path to project root inside container.
+
+        Exactly one of project_url or local_source_path must be provided.
+        local_source_path is used by e2e tests where the target is a local dir.
         """
-        # Install dependencies
+        if local_source_path and project_url:
+            raise ValueError("Provide local_source_path OR project_url, not both.")
+        if not local_source_path and not project_url:
+            raise ValueError("Provide either local_source_path or project_url.")
+
         if dependencies:
             self.exec(
                 f"apt-get update -qq && "
@@ -201,17 +217,33 @@ class DockerRunner:
                 timeout=600,
             )
 
-        # Clone target
-        project_dir = f"/workspace/{self.cve_id}/src"
-        self.exec(f"git clone --depth=50 {project_url} {project_dir}")
-        self.exec(f"git -C {project_dir} checkout {commit}")
+        if local_source_path:
+            project_dir = self.copy_local_source(local_source_path)
+        else:
+            project_dir = f"/workspace/{self.cve_id}/src"
+            self.exec(f"git clone --depth=50 {project_url} {project_dir}")
+            self.exec(f"git -C {project_dir} checkout {commit}")
 
-        # Build
         for cmd in build_commands:
-            self.exec(cmd, cwd=project_dir,
-                      timeout=self.config.build_timeout)
+            self.exec(cmd, cwd=project_dir, timeout=self.config.build_timeout)
 
         return Path(project_dir)
+
+    def copy_local_source(self, local_path: str) -> str:
+        """Copy a local directory into the container via docker cp.
+
+        Used by e2e tests where the target is a local C file, not a git repo.
+        Returns: absolute path inside the container.
+        """
+        container_path = f"/workspace/{self.cve_id}/src"
+        self.exec(f"mkdir -p {container_path}")
+        result = self._local_run(
+            ["docker", "cp", f"{local_path}/.", f"{self.container_id}:{container_path}"],
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"[{self.cve_id}] docker cp failed: {result.stderr}")
+        return container_path
 
     # ── Phase 1 ────────────────────────────────────────────────────────
 
@@ -255,36 +287,42 @@ class DockerRunner:
         """
         Inside container: compile driver + slice to LLVM bitcode.
         Returns (success, diagnostic_message).
+
+        IMPORTANT: source files are written via docker cp from a temp dir
+        (not via the shared volume path which may be root-owned after
+        exec mkdir — see CLAUDE.md Known Issues Session 8).
         """
+        import tempfile
+        from pathlib import Path as _Path
+
         harness_dir = f"/workspace/{self.cve_id}/harness"
         self.exec(f"mkdir -p {harness_dir}")
 
-        # Write harness files into container via shared volume
-        host_harness = self.config.workspace_base / self.cve_id / "harness"
-        host_harness.mkdir(parents=True, exist_ok=True)
-        (host_harness / "driver.c").write_text(driver_c)
-        (host_harness / "slice.c").write_text(slice_c)
+        # Use docker cp so we never write to the root-owned volume path
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = _Path(tmpdir)
+            (tmp / "driver.c").write_text(driver_c, encoding="utf-8")
+            (tmp / "slice.c").write_text(slice_c, encoding="utf-8")
+            cp = self._local_run(
+                ["docker", "cp", f"{tmpdir}/.", f"{self.container_id}:{harness_dir}"],
+                check=False,
+            )
+            if cp.returncode != 0:
+                return False, f"docker cp harness files failed: {cp.stderr}"
 
-        includes = " ".join(include_paths)
+        includes = " ".join(f"-I{p}" for p in include_paths) if include_paths else ""
 
-        # Compile to bitcode
-        driver_result = self.exec(
-            f"clang -O0 -g -emit-llvm -c "
-            f"{includes} "
-            f"{harness_dir}/driver.c -o {harness_dir}/driver.bc",
-            check=False,
-        )
-        if driver_result["exit_code"] != 0:
-            return False, driver_result["stderr"]
-
-        slice_result = self.exec(
-            f"clang -O0 -g -emit-llvm -c "
-            f"{includes} "
-            f"{harness_dir}/slice.c -o {harness_dir}/slice.bc",
-            check=False,
-        )
-        if slice_result["exit_code"] != 0:
-            return False, slice_result["stderr"]
+        # Compile each source to bitcode
+        for src, out in [("driver.c", "driver.bc"), ("slice.c", "slice.bc")]:
+            r = self.exec(
+                f"clang -O0 -g -emit-llvm -c "
+                f"-Xclang -disable-O0-optnone "
+                f"{includes} "
+                f"{harness_dir}/{src} -o {harness_dir}/{out}",
+                check=False,
+            )
+            if r["exit_code"] != 0:
+                return False, r["stderr"]
 
         # Link
         link_result = self.exec(
@@ -318,19 +356,26 @@ class DockerRunner:
             check=False,
         )
 
-        # Parse outcome
         stderr = result["stderr"]
-        ktest_paths = []
 
-        if "memory error" in stderr or "KLEE: ERROR" in stderr:
+        # Collect .ktest files via shared volume (always, before deciding outcome)
+        host_klee_out = (
+            self.config.workspace_base / self.cve_id / f"klee-out-{spec_id}"
+        )
+        ktest_paths: list[str] = []
+        if host_klee_out.exists():
+            ktest_paths = sorted(str(p) for p in host_klee_out.glob("*.ktest"))
+
+        # Parse outcome: case-insensitive check for memory errors
+        real_error = (
+            "memory error" in stderr.lower()
+            or "invalid memory access" in stderr.lower()
+        )
+        sailor_assert = "SAILOR_SINK_REACHED" in stderr
+
+        if real_error and ktest_paths:
             outcome = "bug_triggered"
-            # Collect .ktest files (via shared volume)
-            host_klee_out = (self.config.workspace_base / self.cve_id
-                             / f"klee-out-{spec_id}")
-            ktest_paths = [
-                str(p) for p in host_klee_out.glob("*.ktest")
-            ]
-        elif "SAILOR_SINK_REACHED" in stderr:
+        elif sailor_assert and ktest_paths:
             outcome = "site_reached"
         else:
             outcome = "not_reached"
@@ -339,7 +384,7 @@ class DockerRunner:
         probes_entered = [
             line.split("SPINE_PROBE:")[1].split(":")[0]
             for line in stderr.splitlines()
-            if "SPINE_PROBE:" in line
+            if "SPINE_PROBE:" in line and ":" in line.split("SPINE_PROBE:")[1]
         ]
 
         return {
@@ -385,15 +430,28 @@ class DockerRunner:
         Inside container: compile replay driver + run against ASan archive.
         Returns {crashed, asan_output}.
         """
+        import tempfile
+        from pathlib import Path as _Path
+
         replay_dir = f"/workspace/{self.cve_id}/replay"
         self.exec(f"mkdir -p {replay_dir}")
 
-        # Write replay driver via shared volume
-        host_replay = self.config.workspace_base / self.cve_id / "replay"
-        host_replay.mkdir(parents=True, exist_ok=True)
-        (host_replay / "replay_driver.c").write_text(replay_driver_c)
+        # Write replay_driver.c via docker cp to avoid root-owned volume path
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = _Path(tmpdir)
+            (tmp / "replay_driver.c").write_text(replay_driver_c, encoding="utf-8")
+            cp = self._local_run(
+                ["docker", "cp", f"{tmpdir}/.", f"{self.container_id}:{replay_dir}"],
+                check=False,
+            )
+            if cp.returncode != 0:
+                return {
+                    "crashed": False,
+                    "asan_output": f"docker cp replay_driver failed: {cp.stderr}",
+                    "error": "compile_failed",
+                }
 
-        includes = " ".join(include_paths)
+        includes = " ".join(f"-I{p}" for p in include_paths) if include_paths else ""
 
         # Compile
         compile_result = self.exec(
@@ -478,13 +536,20 @@ class DockerRunner:
 
 ---
 
-## File 2: `sailor/infra/celery_tasks.py`
+## File 2: `sailor/infra/celery_tasks.py` (standalone evaluation pipeline only)
+
+> **Architecture note**: The web application uses Celery tasks defined in
+> `backend/tasks/phase1.py`, `phase2.py`, `phase3.py` with the FastAPI ORM
+> (PostgreSQL + SQLAlchemy). The file below (`sailor/infra/celery_tasks.py`)
+> is used only by the **standalone evaluation pipeline** (`sailor/evaluation/`)
+> which uses a SQLite `EvaluationDB` instead of the web-app state store.
+> Never import `sailor.infra.celery_tasks` from backend code.
 
 ```python
 """
-Celery task definitions for Sailor Phase 1/2/3.
+Celery task definitions for the standalone evaluation pipeline (Sailor Phase 1/2/3).
 Each task runs inside a DockerRunner container.
-Results are saved to EvaluationDB immediately (DB checkpoint).
+Results are saved to EvaluationDB (SQLite) immediately (DB checkpoint).
 """
 
 from celery import Celery
@@ -774,19 +839,26 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Copy only sailor package (no build tools needed here)
-COPY requirements.txt .
+# Install Python dependencies from the backend directory
+COPY backend/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY sailor/ ./sailor/
-COPY core/ ./core/
+# Copy backend code (tasks/, celery_app.py, config.py, database.py, services/, etc.)
+COPY backend/ ./
 
-# Celery worker — dispatches tasks to runner containers
-CMD ["celery", "-A", "sailor.infra.celery_tasks", "worker",
-     "--loglevel=info",
-     "--concurrency=4",
+# Copy sailor package — used by phase tasks via DockerRunner
+COPY sailor/ ./sailor/
+
+# Worker runs tasks.phase1/2/3 from the backend celery app
+CMD ["celery", "-A", "celery_app", "worker", \
+     "--loglevel=info", \
+     "--concurrency=4", \
      "-Q", "phase1,phase2,phase3"]
 ```
+
+> Note: The worker uses `backend/celery_app.py` (not `sailor/infra/celery_tasks.py`).
+> `sailor/infra/celery_tasks.py` is used only by the standalone evaluation pipeline
+> (e.g. `sailor/evaluation/pipeline.py`). Web-app Celery tasks live in `backend/tasks/`.
 
 ---
 

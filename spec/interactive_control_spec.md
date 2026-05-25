@@ -1,55 +1,115 @@
-# spec/interactive_control_spec.md
+# `spec/interactive_control_spec.md`
 # Sailor — Interactive Control, User Registration & Download Specification
-#
-# Cross-reference:
-#   spec/frontend_spec.md     ← base UI spec (this file extends it)
-#   spec/backend_spec.md      ← API contracts
-#   paper/paper_phase1.md     ← Phase 1 algorithm
-#   paper/paper_phase2.md     ← Phase 2 algorithm (Algorithm 1)
-#   paper/paper_phase3.md     ← Phase 3 algorithm
+
+> **Version**: 2 (rewritten on top of `shared/contracts/sailor.schema.json`).
+> Every type referenced here — `PipelineFunctionId`, `InterruptPoint`,
+> `FileValidationResult`, `AutoConfig`, the SSE message variants — lives in
+> the shared schema. Do not redefine them in this document or in frontend/
+> backend code. If you find yourself wanting to invent a new type while
+> implementing this spec, add it to the schema first.
+
+Cross-references:
+- `shared/contracts/sailor.schema.json` — single source of truth for all wire types
+- `shared/contracts/README.md` — conflict resolution log, naming rules
+- `spec/frontend_spec.md` — base UI spec (this document extends it)
+- `spec/backend_spec.md` — base API contract (this document extends §4 and §5)
+- `paper/paper_phase1.md`, `paper_phase2.md`, `paper_phase3.md` — algorithms
 
 ---
 
-## 1. Scope
+## 1. Scope and precedence
 
-This document specifies three features added on top of `frontend_spec.md`:
+This document specifies three features on top of `frontend_spec.md` and
+`backend_spec.md`:
 
 ```
-§2  User Registration & Role Management
-§3  Auto/Manual Mode + Per-Function Interrupt System
-§4  Phase-End Download
+§3   User Registration & Role Management
+§4   Auto/Manual Mode + Per-Function Interrupt System
+§5   Phase-End Download
 ```
 
-Where this document conflicts with `frontend_spec.md`, this document
-takes precedence for the features described here.
+Precedence rules (changed from v1):
+
+1. Wire-level types: `shared/contracts/sailor.schema.json` is authoritative.
+2. API contracts: `backend_spec.md` is authoritative; this file may only
+   *add* endpoints, never redefine existing ones.
+3. UI behavior: this document is authoritative for the three features
+   above. `frontend_spec.md` covers the rest.
+4. Where this document and either spec contradict, **fix the contradiction
+   in code review** — do not let drift accumulate.
 
 ---
 
-## 2. User Registration & Role Management
+## 2. Glossary (resolves prior naming drift)
 
-### 2.1 Registration Flow
+| Term used in this document | Schema type / value                              | Notes                                                                     |
+| -------------------------- | ------------------------------------------------ | ------------------------------------------------------------------------- |
+| "function name"            | `PipelineFunctionId` (enum string)               | snake_case, no dots, no display labels. e.g. `phase2_klee_execution`.     |
+| "Auto checkbox"            | `AutoConfig[function_name]` (boolean)            | true = run normally. false = pause and wait.                              |
+| "Interrupt panel"          | UI for an `InterruptPoint` with `status=waiting` | Backend state lives in `InterruptPoint`; UI renders it.                   |
+| "Resume"                   | `InterruptResumeRequest` → status `resumed`      | Pipeline continues with the user's edits.                                 |
+| "Skip"                     | `InterruptSkipRequest` → status `skipped`        | Pipeline continues with the default outputs of the skipped function.     |
+| "Verdict"                  | `VerdictValue` (`confirmed` / `rejected`)        | Lowercase on the wire. UI may capitalize for display.                     |
+| "Validation result"        | `FileValidationResult`                           | Returned with HTTP 200 even when severity=`error`. Distinct from `ApiError`. |
+
+UI display labels (e.g. "KLEE Execution", "Driver Synthesis") are defined
+in **one place only**: `frontend/src/lib/pipelineLabels.ts`. They are a
+map from `PipelineFunctionId` → human-readable string. Backend code never
+sees these labels.
+
+---
+
+## 3. User Registration & Role Management
+
+### 3.1 Registration endpoint
 
 ```
-Public endpoint:  POST /api/auth/register
-                  (accessible without authentication)
+POST /api/auth/register              [public, no auth]
 
-Fields:
-  username        string, 3–32 chars, alphanumeric + underscore
-  email           valid email address
-  password        min 12 chars, at least 1 uppercase + 1 digit + 1 symbol
-  display_name    optional free-text label
-
-On success:
-  → Account created with role = "viewer" (least-privilege default)
-  → Confirmation email sent (if email service configured)
-  → Redirect to /login
-
-On failure:
-  → 400 with field-level errors (username taken, weak password, etc.)
-  → Never reveal whether an email already exists (anti-enumeration)
+Body:    RegisterRequest    (from shared/contracts)
+Response 201: RegisterResponse
+Response 400: ApiError with code ∈ { "username_taken",
+                                     "weak_password",
+                                     "invalid_email",
+                                     "username_format" }
 ```
 
-### 2.2 Registration UI (`/register`)
+`RegisterRequest` (schema, abbreviated):
+
+```
+username      3–32 chars, [A-Za-z0-9_]+
+email         RFC 5322
+password      ≥ 12 chars; ≥1 uppercase, ≥1 digit, ≥1 symbol
+display_name  optional, ≤ 64 chars
+```
+
+Server-side rules:
+
+- **Anti-enumeration**: the response NEVER reveals whether the email is
+  already registered. If the email is taken, the server still returns
+  201 with a freshly generated `user_id` but **does not create the
+  account**, and triggers the "already registered" email flow out of
+  band (when SMTP is configured). UI cannot distinguish success from
+  email-already-exists.
+- **First user is admin**: the very first row in the `users` table gets
+  `role="admin"`. All subsequent registrations get `role="viewer"`.
+  This is the only way to bootstrap; admins promote later users from
+  `/settings/users`.
+- **Password strength**: the server enforces the rules above. The UI
+  also runs a client-side meter (zxcvbn) but the meter is advisory; the
+  server's regex check is authoritative. The meter MUST NOT block
+  submission solely on its own assessment — only the server's 400 with
+  `code="weak_password"` blocks.
+
+Email confirmation:
+
+- If `SMTP_ENABLED=true` in settings: registration creates an account
+  in `disabled=true` state; the user must click the confirmation link
+  to flip `disabled=false`. Logins to disabled accounts return 403 with
+  `code="account_disabled"`.
+- If `SMTP_ENABLED=false` (dev mode): accounts are immediately enabled.
+
+### 3.2 Registration UI (`/register`)
 
 ```
 ┌──────────────────────────────────────────┐
@@ -61,7 +121,7 @@ On failure:
 │  Confirm        [________________]       │
 │  Display name   [________________]       │
 │                                          │
-│  Password strength: ████████░░  Good     │
+│  Password strength: ████████░░  Good     │  ← zxcvbn, advisory only
 │                                          │
 │  [ Create account ]                      │
 │                                          │
@@ -69,877 +129,1046 @@ On failure:
 └──────────────────────────────────────────┘
 ```
 
-Password strength meter:
-- Shows bar + label (Weak / Fair / Good / Strong)
-- Blocks submission until strength ≥ "Good"
-- Powered by zxcvbn or equivalent client-side library
+On 201 response:
+- If `role === "admin"`: show banner "You are the first user — you have
+  been granted admin role."
+- Redirect to `/login` with a flash message "Account created."
 
-Email confirmation:
-- If SMTP is configured: user receives a link, must click before login
-- If SMTP is not configured (dev mode): account is immediately active
+On 400 response:
+- Render field-level errors keyed by `ApiError.detail.field` (e.g.
+  `detail: { field: "username" }`). The UI maps `code` to a localized
+  message; the raw `message` is a fallback.
 
-### 2.3 Roles
+### 3.3 Roles
 
-Inherited from `frontend_spec.md §10`, extended here:
+Inherited from `frontend_spec.md §10`. The schema enum `UserRole` has
+four values:
 
-| Role       | Registration | Run | Intervene | Settings | Admin |
-|------------|-------------|-----|-----------|----------|-------|
-| viewer     | self-register | read | —       | —        | —     |
-| operator   | admin grants  | start/cancel | — | —   | —     |
-| intervener | admin grants  | start/cancel | ✓ | —  | —     |
-| admin      | first user or admin grants | ✓ | ✓ | ✓ | ✓ |
+| Role         | Self-register | Run                 | Intervene | Settings | Admin |
+| ------------ | ------------- | ------------------- | --------- | -------- | ----- |
+| `viewer`     | ✓ (default)   | read                | —         | —        | —     |
+| `operator`   | promoted      | start/cancel        | —         | —        | —     |
+| `intervener` | promoted      | start/cancel        | ✓         | —        | —     |
+| `admin`      | first user only, otherwise promoted | ✓ | ✓ | ✓ | ✓ |
 
-First registered user automatically receives `admin` role.
-All subsequent registrations default to `viewer`.
-Admins promote users at `/settings/users`.
+JWT behavior on role change:
+- **Downgrade** (e.g. `intervener` → `viewer`): existing access tokens
+  are added to a Redis blacklist; subsequent requests get 401.
+- **Upgrade**: takes effect at next token refresh. The user may need to
+  sign out and back in for the new role to apply UI-side (the UI's
+  current role is derived from the token).
 
-### 2.4 User Management UI (`/settings/users`)
+### 3.4 User management (`/settings/users`)
 
-Admin-only. Tabular list of all users:
+Admin-only.
 
 ```
-Columns: username, email, role, registered, last login, actions
-Actions: [Edit role ▼]  [Disable]  [Reset password]  [Delete]
+Endpoints:
+  GET    /api/users                    [admin]   → list of User
+  POST   /api/users/:user_id/role      [admin]   → body: { role: UserRole }
+  POST   /api/users/:user_id/disable   [admin]
+  POST   /api/users/:user_id/enable    [admin]
+  POST   /api/users/:user_id/reset-password [admin]
+  DELETE /api/users/:user_id           [admin]   → soft delete (sets disabled=true,
+                                                   anonymizes email/display_name,
+                                                   preserves audit log link)
 ```
 
-Role change takes effect on next request (JWT invalidated on downgrade).
+UI: standard CRUD table. Role changes write an `AuditEvent` with
+`action="role_change"`.
+
+Restrictions:
+- An admin cannot demote themselves if they are the only admin (server
+  returns 409 `code="last_admin"`).
+- An admin cannot delete themselves; must be deleted by another admin.
 
 ---
 
-## 3. Auto/Manual Mode + Per-Function Interrupt System
+## 4. Auto/Manual Mode + Per-Function Interrupt System
 
-### 3.1 Core Concept
+### 4.1 Core concept
 
-Every pipeline function that can be interrupted has an **Auto checkbox**.
-
-```
-Auto = ON  (default):
-  Function runs automatically without user interaction.
-  This is the standard Sailor pipeline behavior.
-
-Auto = OFF:
-  Pipeline pauses before the function executes.
-  User sees an Interrupt Panel for that function.
-  User inspects/modifies inputs, then clicks "Resume" to proceed.
-  Pipeline stays paused until Resume is clicked or Auto is re-enabled.
-```
-
-Auto state is **per-run-config** (set when creating or editing a run)
-and **per-function** (each function has its own checkbox).
-
-Auto state can also be toggled live on the Run Detail page while a run
-is active. Changes take effect at the next occurrence of that function.
-
-### 3.2 Auto Checkbox Placement
-
-Auto checkboxes appear in two places:
-
-**A. Run Configuration (`/runs/new` and "Edit run config")**
+The pipeline has **14 interruptible functions**, enumerated by
+`PipelineFunctionId` in the schema. For each function, the run carries
+an `AutoConfig` flag:
 
 ```
-Phase 1
-  ☑ Auto  CodeQL DB Build
-  ☑ Auto  Query Execution
-  ☑ Auto  SARIF Parsing
-  ☑ Auto  Fact Enrichment
-  ☑ Auto  Spec Generation
+AutoConfig[function_name] = true   (default)
+  → function runs automatically. Standard Sailor behavior.
 
-Phase 2 (per-spec; applies to all specs in the run)
-  ☑ Auto  Source Exploration
-  ☑ Auto  Driver Synthesis
-  ☑ Auto  Stub Synthesis
-  ☑ Auto  Assertion Instantiation
-  ☑ Auto  Compile & Diagnose
-  ☑ Auto  KLEE Execution
-  ☑ Auto  Harness Refinement
-  ☑ Auto  LLM Generation  [Disable LLM →]
-
-Phase 3 (per-spec)
-  ☑ Auto  Replay Driver Generation
-  ☑ Auto  ASan Compilation
-  ☑ Auto  Concrete Execution
-  ☑ Auto  Result Classification
+AutoConfig[function_name] = false
+  → pipeline pauses immediately before the function executes.
+    An InterruptPoint with status="waiting" is created and persisted.
+    An SSE message of kind="interrupt_created" is published.
+    The function does not run until the user resumes or skips.
 ```
+
+`AutoConfig` is **per-run**: set at run creation, may be edited mid-run.
+There is no global default; missing keys are treated as `true`.
+
+### 4.2 Run-scope vs spec-scope interrupts (resolves v1 OQ-5)
+
+Each `PipelineFunctionId` has a fixed `InterruptScope`:
+
+| `PipelineFunctionId`               | Scope  | When it fires                                            |
+| ---------------------------------- | ------ | -------------------------------------------------------- |
+| `phase1_db_build`                  | `run`  | Once per run, before CodeQL DB creation.                |
+| `phase1_query_execution`           | `run`  | Once per run, before `codeql database analyze`.         |
+| `phase1_sarif_parsing`             | `run`  | Once per run, after CodeQL produces SARIF.              |
+| `phase1_fact_enrichment`           | `run`  | Once per run, before `FactEnricher.enrich()`.           |
+| `phase1_spec_generation`           | `run`  | Once per run, before `SpecificationGenerator`.          |
+| `phase2_spec_selection`            | `run`  | Once per run, after Phase 1 completes, before Phase 2 dispatch. |
+| `phase2_source_exploration`        | `spec` | Per spec, before exploration phase starts.              |
+| `phase2_driver_synthesis`          | `spec` | Per spec, after first `driver.c` draft.                 |
+| `phase2_stub_synthesis`            | `spec` | Per spec, after first `slice.c` draft.                  |
+| `phase2_compile_diagnose`          | `spec` | Per spec, on every compile failure.                      |
+| `phase2_klee_execution`            | `spec` | Per spec, before each KLEE run.                          |
+| `phase3_replay_driver_generation`  | `spec` | Per spec (bug_triggered only).                          |
+| `phase3_asan_compilation`          | `spec` | Per spec (bug_triggered only).                          |
+| `phase3_result_classification`     | `spec` | Per spec (bug_triggered only).                          |
+
+`scope` is **not user-configurable** — it is a property of the function.
+
+**Run-scope semantics**:
+- One waiting interrupt at a time per function per run.
+- Blocks the entire pipeline progression past that function.
+- `spec_id` is `null` on the `InterruptPoint`.
+
+**Spec-scope semantics**:
+- One waiting interrupt at a time per function per spec.
+- Other specs in the same run progress independently.
+- `spec_id` is required on the `InterruptPoint`.
+
+### 4.3 Concurrent interrupts (resolves v1 OQ-1)
+
+If 128 specs in parallel hit `phase2_klee_execution` with auto=false, the
+UI must not open 128 panels. Resolution:
+
+**The InterruptPoint list view replaces the modal-overlay pattern.**
+
+```
+/runs/:run_id/interrupts                  ← list of all waiting interrupts
+/runs/:run_id/interrupts/:interrupt_id    ← single interrupt panel
+```
+
+UI behavior:
+- A waiting interrupt is **never auto-opened** as a modal. When
+  `interrupt_created` arrives via SSE and the user is not on that
+  interrupt's panel, the UI shows a non-intrusive toast and increments
+  a "waiting" badge in the navigation.
+- The user opens the interrupts list explicitly and works through them.
+- **"Apply to all matching"** (`InterruptResumeRequest.apply_to_all_matching`):
+  when resuming with `apply_to_all_matching=true`, the same
+  `option_overrides` are applied to all currently-waiting interrupts in
+  this run with the same `function_name`. `modified_files` MUST be empty
+  for this case — per-spec file edits cannot be broadcast. Server
+  returns 422 with `code="bulk_modify_with_files"` if violated.
+- **"Re-enable Auto"** (`InterruptResumeRequest.re_enable_auto`): toggles
+  `AutoConfig[function_name]` back to `true` after this resume.
+  Combined with `apply_to_all_matching=true`, this is the standard
+  "I'm done supervising this function, just let it run" workflow.
+- **Auto-skip on timeout**: deferred to a later iteration. Not in MVP.
+
+### 4.4 AutoConfig endpoints
+
+```
+GET   /api/runs/:run_id/auto-config                 [viewer+]
+      Response 200: AutoConfig (full map; missing keys = true)
+
+PATCH /api/runs/:run_id/auto-config                 [operator+]
+      Body:    AutoConfigPatch (partial; only included keys are changed)
+      Response 200: AutoConfig (the full post-update config)
+      Effect: takes effect at the NEXT occurrence of each changed function.
+              Existing waiting interrupts for that function are not
+              automatically resolved — the operator must resume/skip them
+              explicitly. Audit event written with action="auto_config_change".
+      SSE:    emits {kind: "auto_config_changed", payload: AutoConfigChangedPayload}
+              on topic runs.<run_id>.
+```
+
+Critical rules:
+- The body keys are exactly the `PipelineFunctionId` enum values. Keys
+  with dots (e.g. `"phase2.klee_execution"`) are rejected with 422
+  `code="invalid_function_name"`.
+- Editing AutoConfig does NOT pause the pipeline. If a function is
+  already running when its auto flag is toggled to `false`, the current
+  invocation completes; the next one pauses.
+
+### 4.5 Interrupt endpoints
+
+```
+GET   /api/runs/:run_id/interrupts                            [viewer+]
+      Query:   status (default: waiting), function_name, spec_id, scope
+      Response 200: paginated list of InterruptPoint
+
+GET   /api/runs/:run_id/interrupts/:interrupt_id              [viewer+]
+      Response 200: InterruptPoint with input_files populated
+                    (each artifact_ref resolvable via GET /api/artifacts/:ref)
+
+POST  /api/runs/:run_id/interrupts/:interrupt_id/files        [intervener+]
+      Multipart upload of a single replacement file.
+      Body:    multipart/form-data with field "file" and field "name" (logical name)
+      Response 200: { artifact_ref: string, validation: FileValidationResult }
+      Effect:  uploads to artifact store with a versioned path, runs validation
+               server-side, returns both ref and validation. The user examines
+               validation result; if severity=error, they typically retry with a
+               corrected file. The returned artifact_ref is then passed in the
+               subsequent resume call's modified_files entry.
+
+POST  /api/runs/:run_id/interrupts/:interrupt_id/resume       [intervener+]
+      Body:    InterruptResumeRequest
+      Response 200: { interrupt: InterruptPoint (with status="resumed") }
+      Response 409: ApiError code="version_mismatch" (a modified_files entry's
+                    base_version is stale)
+      Response 422: ApiError code="bulk_modify_with_files" (apply_to_all_matching
+                    is true but modified_files is non-empty)
+      Effect:  - Validates all referenced files (artifact_refs must exist).
+               - Re-runs validation on the chosen files; if any has severity=error,
+                 returns 422 with code="validation_failed" and the
+                 FileValidationResult in detail.
+               - Applies option_overrides via the function's option schema (§4.6).
+               - Writes interrupt_points row to status="resumed".
+               - Unblocks the worker task for this function.
+               - Emits {kind: "interrupt_resolved", payload: {..., resolution: "resumed"}}.
+               - If apply_to_all_matching=true, repeats for each matching waiting
+                 interrupt in the same run; emits one interrupt_resolved per
+                 affected interrupt.
+               - Writes AuditEvent action="interrupt_resume".
+
+POST  /api/runs/:run_id/interrupts/:interrupt_id/skip         [intervener+]
+      Body:    InterruptSkipRequest
+      Response 200: { interrupt: InterruptPoint (with status="skipped") }
+      Effect:  - Writes interrupt_points row to status="skipped".
+               - Worker proceeds with the default function output (the
+                 LLM-generated artifact, the auto-classified verdict, etc.).
+               - Emits {kind: "interrupt_resolved", payload: {..., resolution: "skipped"}}.
+               - Writes AuditEvent action="interrupt_skip".
+
+POST  /api/validate/file                                       [public]
+      Body:    multipart/form-data with field "file" and field "filename"
+               (logical name including extension — drives validator dispatch)
+      Response 200: FileValidationResult
+      Note:    Stateless; does NOT upload to artifact store. Used by the UI
+               for inline pre-flight validation before /files upload.
+               Even severity="error" returns HTTP 200.
+```
+
+### 4.6 Per-function option schemas
+
+`InterruptResumeRequest.option_overrides` is an open `object` in the
+shared schema — backend validates per `function_name`. The accepted
+shapes are:
+
+```
+phase1_db_build:
+  build_command:        string (optional override; defaults to RunConfig.build_command)
+  existing_db_ref:      string (optional artifact_ref of a pre-built DB)
+  → Validation: at least one of build_command or existing_db_ref must be present.
+
+phase1_query_execution:
+  query_ids:            string[] (subset of the run's configured queries)
+  → Validation: at least 1; each must exist in the catalog or be a modified_file.
+
+phase1_sarif_parsing:
+  (no options; user only edits the sarif file)
+
+phase1_fact_enrichment:
+  (no options; user only edits findings.json)
+
+phase1_spec_generation:
+  skip_file_patterns:    string[] (regex overrides; replaces RunConfig.phase1_skip_files
+                                    for this invocation only)
+  skip_function_patterns: string[]
+
+phase2_spec_selection:
+  selected_spec_ids:    string[] (subset of Phase 1 emitted specs)
+  → Validation: ≥ 1; all must be valid spec_ids in this run.
+
+phase2_source_exploration:
+  phase2_t_explore:     integer (override for this spec only)
+  phase2_t_author:      integer
+  phase2_t_max:         integer
+  phase2_r_max:         integer
+  → Validation: phase2_t_explore + phase2_t_author ≤ phase2_t_max.
+
+phase2_driver_synthesis:
+  (no options; user edits driver.c)
+
+phase2_stub_synthesis:
+  stub_overrides:       array of { function_name, granularity, return_value }
+                        (overrides for which functions are stubbed and how)
+
+phase2_compile_diagnose:
+  apply_suggested_fix:  boolean (if true, server applies the auto-fix before resuming)
+
+phase2_klee_execution:
+  klee_search_strategies: string[]   (subset of {"random-path", "dfs", "bfs", "nurs:cov"})
+  klee_timeout_seconds:   integer    (1 ≤ x ≤ 3600)
+  klee_max_depth:         integer
+
+phase3_replay_driver_generation:
+  (no options; user edits replay_driver.c)
+
+phase3_asan_compilation:
+  asan_build_command:   string
+  asan_options:         string    (value for ASAN_OPTIONS env var)
+
+phase3_result_classification:
+  classification:       ClassifyVerdictRequest (schema type)
+                        { verdict: "confirmed"|"rejected", cwe?, reason? }
+```
+
+Unknown keys for a given function are rejected with 422 `code="unknown_option"`.
+
+### 4.7 Input file validation rules
+
+The validator dispatches by filename suffix (and signature for binary).
+All rules return `FileValidationResult` shapes; the table summarizes:
+
+```
+*.sarif | *.json with "runs" key  → SARIFValidator
+  detected_format: "sarif"
+  ERROR:   not valid JSON
+  ERROR:   missing top-level "runs" array
+  WARNING: results count = 0
+  WARNING: signature mismatch (PDF/ELF/ZIP detected as content)
+
+findings.json                     → FindingsValidator
+  detected_format: "json-array:findings"
+  ERROR:   not a JSON array
+  ERROR:   any element missing required fields (finding_id, rule_id,
+           cwe, location.file, location.line)
+  WARNING: any finding has empty suspect_calls
+
+fact_packs.json                   → FactPacksValidator
+  detected_format: "json-array:fact-packs"
+  ERROR:   not a JSON array
+  ERROR:   any element missing required fields (finding, build_context)
+
+specifications.json | spec.json   → SpecValidator
+  detected_format: "json:spec"
+  ERROR:   not a VulnerabilitySpec (schema validation against Spec type)
+  ERROR:   assertion_template empty
+  ERROR:   entrypoint empty string
+
+*.c                               → CSourceValidator
+  detected_format: "c-source"
+  ERROR:   clang --syntax-only fails (uses the run's include paths inside DockerRunner)
+  Additional rules when filename matches replay_driver*.c:
+  ERROR:   any of the following symbols appears as a call site:
+             klee_make_symbolic, klee_assume, klee_assert, klee_warning_once
+           Rule id: "replay_driver.klee_call_present"
+           Issues list contains line numbers for each occurrence.
+  ERROR:   no non-trivial concrete assignments detected (heuristic;
+           rule id: "replay_driver.no_concrete_assigns").
+
+*.ql                              → CodeQLValidator
+  detected_format: "ql"
+  ERROR:   codeql query compile --check-only fails
+
+*.ktest                           → KTestValidator
+  detected_format: "ktest"
+  ERROR:   does not start with "KTEST" magic bytes
+  WARNING: file empty
+
+*.bc                              → BitcodeValidator
+  detected_format: "bitcode"
+  ERROR:   does not start with 0x42 0x43 magic bytes
+  NOTE:    .bc files are view-only — InterruptInputFile.editable=false.
+           The validator runs only on uploaded bitcode (rare; replacement
+           is the only path, no inline edit).
+```
+
+The validator is the **same code path** server-side regardless of whether
+called via `/api/validate/file` (pre-flight) or the implicit run during
+`/files` upload. Frontend never validates structure locally.
+
+### 4.8 File replacement workflow
+
+```
+        ┌─────────────────────────────────────┐
+        │  User opens an InterruptPoint panel │
+        └─────────────────┬───────────────────┘
+                          │
+                          ▼
+        ┌─────────────────────────────────────┐
+        │ Panel lists input_files. For each,  │
+        │ user may [View] [Edit] [Replace].   │
+        └─────────────────┬───────────────────┘
+                          │
+                          ▼
+        Optional pre-flight: POST /api/validate/file
+        (UI runs this when user picks a file from disk
+         BEFORE uploading, to give early feedback)
+                          │
+                          ▼
+        Upload: POST /api/runs/.../interrupts/:id/files
+        → Returns { artifact_ref, validation: FileValidationResult }
+        → UI displays the validation result inline. If severity=error,
+          the file is still uploaded (so the user doesn't lose work)
+          but is marked as "won't be used unless fixed".
+                          │
+                          ▼
+        Repeat for other files as needed.
+                          │
+                          ▼
+        Resume: POST /api/runs/.../interrupts/:id/resume
+        Body references the artifact_refs from the upload step.
+        Server re-validates (cheap; just re-fetches the result from cache)
+        and refuses to resume if any referenced file has severity=error.
+```
+
+**Why two-step** (upload then resume, vs. base64 inline):
+- A single SARIF file can be 50–500 MB. Inlining as base64 in a JSON
+  body inflates by 33% and pushes the request over typical proxy limits.
+- Validation results are useful BEFORE committing to resume; the user
+  may want to upload, see the warning, decide.
+- Maps cleanly to the artifact store abstraction (`PUT artifact` →
+  presigned upload URL → server-side validation hook).
+
+**Archival**: when a file replaces an existing artifact, the old
+`artifact_ref` is preserved (artifact store is content-addressed; no
+overwrite). The `InterruptPoint.input_files[*].artifact_ref` is updated
+to the new ref. Old refs remain reachable via the audit log
+(`AuditEvent.diff` records the before/after refs).
+
+### 4.9 Auto checkbox placement (UI)
+
+Auto checkboxes appear in two places — both write to `AutoConfigPatch`:
+
+**A. Run creation (`/runs/new` and "Edit run config")**
+
+Displayed grouped by phase. Each row is a single checkbox. The form
+collects an `AutoConfigPatch` (all keys initially unset = default `true`).
+On submit, the patch is sent with the run-creation request and applied
+atomically with the run's config.
 
 **B. Run Detail page (`/runs/:run_id`)**
 
-Compact version in a collapsible sidebar panel titled "Pipeline Controls".
-Same checkboxes, same effect. Live toggle.
+Collapsible sidebar "Pipeline Controls" panel with the same 14 checkboxes,
+fed by `GET /api/runs/:run_id/auto-config`. Toggling a checkbox sends
+a `PATCH` with a single-key `AutoConfigPatch`. Optimistic UI: flip the
+checkbox immediately; revert on error.
 
-### 3.3 Interrupt Panel
+Both surfaces use the same `PipelineFunctionId` → display-label map from
+`frontend/src/lib/pipelineLabels.ts`.
 
-When Auto = OFF and pipeline reaches that function, a full-screen
-overlay (or side drawer) appears for that function.
+### 4.10 Per-function interrupt panel specifications
 
-Common elements in every Interrupt Panel:
+For each function, this section lists:
+- **What input files** appear in `InterruptPoint.input_files`.
+- **What option_overrides** keys are accepted (cross-reference to §4.6).
+- **What special validation** applies beyond §4.7's general rules.
+
+All panels share the common chrome from §4.11.
+
+#### 4.10.1 `phase1_db_build`
+
+```
+Input files:
+  (none — this function generates files, doesn't consume them)
+Options (§4.6):
+  build_command, existing_db_ref
+Special validation:
+  - If existing_db_ref provided: the artifact must contain a marker file
+    indicating a valid CodeQL DB (presence of `codeql-database.yml`).
+  - If build_command empty and no existing_db_ref: resume blocked with
+    code="missing_build_input".
+```
+
+#### 4.10.2 `phase1_query_execution` — Query Selector
+
+```
+Input files:
+  Each query as a *.ql artifact (read-only by default, editable on demand).
+Options:
+  query_ids (subset selected)
+Special validation:
+  - ≥ 1 query selected.
+  - Any modified .ql passes CodeQLValidator.
+  - "Modified queries are used for this run only" — backend does NOT
+    write them back to the query catalog.
+UI notes:
+  - Each query row expands to show .ql source in CodeMirror.
+  - Edit button promotes to an editable view; on save, file is uploaded
+    via /files and added to modified_files for this interrupt.
+  - Estimated runtime hint is purely a UI affordance; not part of the
+    contract.
+```
+
+#### 4.10.3 `phase1_sarif_parsing`
+
+```
+Input files:
+  findings.sarif
+Options:
+  (none)
+Special validation:
+  - SARIFValidator rules from §4.7.
+```
+
+#### 4.10.4 `phase1_fact_enrichment`
+
+```
+Input files:
+  findings.json
+Options:
+  (none)
+Special validation:
+  - FindingsValidator rules from §4.7.
+```
+
+#### 4.10.5 `phase1_spec_generation`
+
+```
+Input files:
+  fact_packs.json
+Options:
+  skip_file_patterns, skip_function_patterns
+Special validation:
+  - FactPacksValidator rules.
+  - Pattern lists must be valid regex (server compiles and validates;
+    failure returns code="invalid_regex" with the bad pattern in detail).
+UI notes:
+  - "Filter preview: X of Y fact packs will pass the current filter rules"
+    is a derived UI display computed client-side from the loaded
+    fact_packs.json + the current skip patterns. Not stored.
+```
+
+#### 4.10.6 `phase2_spec_selection`
+
+```
+Input files:
+  Each VulnerabilitySpec as a JSON artifact (editable).
+Options:
+  selected_spec_ids
+Special validation:
+  - SpecValidator on any edited spec.
+  - At least 1 selected_spec_id.
+UI notes:
+  - Cost estimate is a UI calculation from settings.pricing[provider] ×
+    avg_tokens_per_spec × selected_count. The pricing source is
+    /api/settings.pricing (admin-managed).
+```
+
+#### 4.10.7 `phase2_source_exploration`
+
+```
+Input files:
+  spec.json (the VulnerabilitySpec for this spec_id, editable)
+Options:
+  phase2_t_explore, phase2_t_author, phase2_t_max, phase2_r_max
+Special validation:
+  - SpecValidator.
+  - phase2_t_explore + phase2_t_author ≤ phase2_t_max
+    (server returns 422 code="invalid_budget" if violated).
+```
+
+#### 4.10.8 `phase2_driver_synthesis`
+
+```
+Input files:
+  driver.c (LLM-generated; editable)
+  spec.json (read-only reference)
+Options:
+  (none)
+Special validation:
+  - CSourceValidator. clang must accept driver.c with the run's include
+    paths.
+```
+
+#### 4.10.9 `phase2_stub_synthesis`
+
+```
+Input files:
+  slice.c (LLM-generated; editable)
+Options:
+  stub_overrides
+Special validation:
+  - CSourceValidator on slice.c.
+  - CWE-416 rule: if slice.c contains free() calls, each stubbed
+    free() function MUST internally call the real free(). Validator
+    rule id "stub.cwe416_free_not_called"; severity=error blocks resume.
+```
+
+#### 4.10.10 `phase2_compile_diagnose`
+
+```
+Input files:
+  driver.c, slice.c, stubs.c (all editable)
+  compile_output.txt (read-only; the clang/llvm-link stderr)
+Options:
+  apply_suggested_fix
+Special validation:
+  - All three .c files must compile (CSourceValidator) after any edits.
+UI notes:
+  - error_class from the contract (CompileErrorClass enum) drives the UI
+    badge: "incomplete_type" | "conflicting_proto" | "redefinition" | "other".
+```
+
+#### 4.10.11 `phase2_klee_execution`
+
+```
+Input files:
+  harness.bc (binary, view-only; hex dump UI)
+Options:
+  klee_search_strategies, klee_timeout_seconds, klee_max_depth
+Special validation:
+  - klee_timeout_seconds ∈ [1, 3600].
+  - klee_search_strategies: at least 1; each ∈ allowed set.
+UI notes:
+  - The previous KLEE run's output (if any) is shown read-only.
+  - Coverage probe summary (entered/missed functions) is derived from
+    the last KleeRunPayload on this spec's turn list.
+  - harness.bc cannot be edited here; to change harness, the user must
+    go back via phase2_driver_synthesis or phase2_stub_synthesis interrupts.
+```
+
+#### 4.10.12 `phase3_replay_driver_generation`
+
+```
+Input files:
+  replay_driver.c (editable)
+  witness.ktest (binary, view-only; UI parses witness values into a table)
+Options:
+  (none)
+Special validation:
+  - CSourceValidator + the replay_driver-specific rule from §4.7
+    (no klee_* calls; severity=error blocks resume).
+```
+
+#### 4.10.13 `phase3_asan_compilation`
+
+```
+Input files:
+  asan_build.log (read-only, last build output if any)
+Options:
+  asan_build_command, asan_options
+Special validation:
+  - Server checks the compile command will NOT include any
+    LLM-generated stub files (file path inspection against the run's
+    artifact store layout). If a stub path is detected, returns 422
+    code="stub_in_asan_build".
+  - asan_options is parsed as a colon-separated key=value string; invalid
+    format returns code="invalid_asan_options".
+```
+
+#### 4.10.14 `phase3_result_classification`
+
+```
+Input files:
+  asan_report.txt (read-only)
+Options:
+  classification (ClassifyVerdictRequest schema):
+    verdict: "confirmed" | "rejected"
+    cwe: optional override
+    reason: optional free-text
+Special validation:
+  - verdict ∈ VerdictValue (lowercase only — "CONFIRMED" returns 422).
+  - WARNING (non-blocking) if verdict="confirmed" but the parsed ASan
+    stack trace has no frame in the project source. Issue rule id
+    "classify.no_project_frame".
+UI notes:
+  - The parsed stack trace with "project source?" column is rendered
+    from the asan_report.txt content — not from a separate API call.
+```
+
+### 4.11 Common interrupt panel chrome
+
+Every panel has:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  ⏸  Interrupted: <Function Name>                                │
-│  Spec: <spec_id>  |  Phase: <N>  |  Turn: <t>/<T_max>          │
+│  ⏸  Interrupted: <display label for function_name>              │
+│  Run: <run_name>  |  Phase: <phase from function_name prefix>   │
+│  [Spec: <spec_id> | Turn: <turn>/<phase2_t_max>] (spec-scope)   │
 ├─────────────────────────────────────────────────────────────────┤
-│  INPUT FILES                  [Validate] [Replace file ↑]       │
+│  INPUT FILES                                                    │
 │  ┌───────────────────────────────────────────────────────────┐  │
-│  │  📄 <filename>   <size>   <type>   [View] [Edit] [Replace] │  │
-│  │  📄 ...                                                    │  │
+│  │  📄 <name>   <size>   <detected_format>                   │  │
+│  │     [View] [Edit] [Replace] [Download]                     │  │
+│  │     (FileValidationResult banner if last upload validated) │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │                                                                 │
-│  <Function-specific controls — see §3.4 through §3.15>          │
+│  OPTIONS                                                        │
+│  (function-specific form per §4.10)                             │
 │                                                                 │
 ├─────────────────────────────────────────────────────────────────┤
-│  [  Resume with current inputs  ]    [  Skip this function  ]   │
-│  [ ☑ Auto (re-enable for future) ]                              │
+│  [☐ Apply to all matching interrupts in this run]               │
+│  [☐ Re-enable Auto for this function after resuming]            │
+│                                                                 │
+│  [ Resume ]    [ Skip ]    [ Cancel ]                           │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-**File replacement rules:**
+UI behavior:
+- **Cancel** closes the panel without submitting; the interrupt stays
+  in `waiting`. It does not write any state.
+- **Resume** is disabled while any uploaded file has severity=error.
+- **Skip** is always enabled (skipping doesn't depend on file validity).
+- The two checkboxes are mutually compatible. Re-enable Auto without
+  Apply to all = "from now on, run automatically". Both together = the
+  common case after deciding the function's defaults are fine.
 
-- Any input file can be replaced by uploading a new file.
-- On replacement, the server runs structural validation before accepting.
-- If validation fails, a warning banner appears (see §3.16).
-- Non-binary files (JSON, C, SARIF, QL) can be viewed and edited inline.
-- Binary files (.ktest, .bc) are view-only with a hex dump option.
+### 4.12 Manual harness mode (resolves v1 §3.15 ambiguity)
 
-### 3.4 Phase 1 — CodeQL DB Build Interrupt
-
-```
-Interrupt point: before codeql database create is invoked.
-
-Inputs shown:
-  build_command   (editable text field)
-  project_root    (read-only path)
-
-Controls:
-  Build command   [_____________________________]
-  CodeQL DB path  [_____________________________]
-  ☑ Use existing DB  [Browse...]
-
-User can:
-  - Edit the build command before execution.
-  - Point to an existing pre-built CodeQL DB to skip the build step.
-    (Useful when the user already has a DB from a previous run.)
-
-Validation on Resume:
-  - If "Use existing DB": verify the path contains a valid QL DB
-    (check for db-cpp/ or similar marker directory).
-  - If build command is empty and no existing DB: block Resume,
-    show error "Build command required."
-```
-
-### 3.5 Phase 1 — Query Execution Interrupt (Query Selector)
+"Disable LLM" is **a per-spec configuration flag**, not an interrupt
+that fires every turn. It is exposed via:
 
 ```
-Interrupt point: before codeql database analyze is invoked.
+POST  /api/runs/:run_id/specs/:spec_id/manual-harness          [intervener+]
+      Body:    { enabled: boolean }
+      Response 200: ManualHarnessMode
 
-This is the CodeQL Query Selector. It shows all 34 queries in a
-scrollable checklist. The user selects which queries to run.
-
-┌─────────────────────────────────────────────────────────────────┐
-│  Select CodeQL Queries to Execute                               │
-│  ☑ Select all   ☐ Deselect all   [Search queries...]           │
-├──────┬──────────────────────────────────────┬──────────┬───────┤
-│  ☑   │  local/cpp/cwe-120-overflow           │  CWE-120 │  [▼]  │
-│  ☑   │  local/cpp/cwe-122-heap-overflow      │  CWE-122 │  [▼]  │
-│  ☑   │  local/cpp/cwe-416-uaf               │  CWE-416 │  [▼]  │
-│  ☐   │  local/cpp/cwe-674-recursion         │  CWE-674 │  [▼]  │
-│  ...  (scrollable, all 34 queries listed)                       │
-├─────────────────────────────────────────────────────────────────┤
-│  Enabled: 33 / 34   Estimated runtime: ~8 min                   │
-└─────────────────────────────────────────────────────────────────┘
-
-[▼] expand row → shows full query source (.ql content) in a
-    syntax-highlighted, read-only CodeMirror panel.
-    "Edit" button opens the query in an editable CodeMirror panel.
-    User can modify query content before execution.
-    Modified query is used only for this run (not saved globally).
-
-Validation on Resume:
-  - At least 1 query must be selected.
-  - Any modified query must be valid QL syntax
-    (server-side: codeql query compile --check-only).
+GET   /api/runs/:run_id/specs/:spec_id/manual-harness          [viewer+]
+      Response 200: ManualHarnessMode
 ```
 
-### 3.6 Phase 1 — SARIF Parsing Interrupt
-
-```
-Interrupt point: after codeql analyze returns, before _parse_sarif().
-
-Input shown:
-  findings.sarif   (raw SARIF output from CodeQL)
-
-Controls:
-  [View SARIF]     opens JSON viewer (collapsible tree, searchable)
-  [Replace SARIF]  upload a custom SARIF file instead
-  Summary:
-    Runs: <N>    Total findings: <M>
-
-Validation on Resume (applied to whichever SARIF is active):
-  - Must be valid JSON.
-  - Must contain "runs" array (SARIF 2.1.0 schema).
-  - "results" array must be present (may be empty).
-  - Each result must have "locations[0].physicalLocation.artifactLocation.uri"
-    and "locations[0].physicalLocation.region.startLine".
-  Warning (non-blocking) if findings count = 0.
-```
-
-### 3.7 Phase 1 — Fact Enrichment Interrupt
-
-```
-Interrupt point: before FactEnricher.enrich() is called for each finding.
-
-Input shown:
-  findings.json   (parsed SARIFFinding list — editable JSON)
-
-Controls:
-  [View / Edit findings.json]   CodeMirror JSON editor
-  [Replace findings.json]       upload replacement
-
-User can:
-  - Remove specific findings (delete entries from the JSON array).
-  - Edit finding fields (description, location, trace).
-  - Add findings manually.
-
-Validation on Resume:
-  - Must be valid JSON array.
-  - Each element must have: finding_id, rule_id, cwe, location.file,
-    location.line, description (schema from design/CLAUDE_phase1.md).
-  Warning if any finding has an empty suspect_calls after enrichment
-  (non-blocking).
-```
-
-### 3.8 Phase 1 — Spec Generation Interrupt
-
-```
-Interrupt point: after FactEnricher runs, before SpecificationGenerator.
-
-Input shown:
-  fact_packs.json   (FactPack list — editable JSON)
-
-Controls:
-  [View / Edit fact_packs.json]   CodeMirror JSON editor
-  Filter preview:
-    "X of Y fact packs will pass the current filter rules."
-    [View skip patterns]  [Edit skip patterns]
-
-User can:
-  - Edit any FactPack field (suspect_calls, bounds_hints, etc.).
-  - Override the FILE_SKIP_PATTERNS and FUNCTION_SKIP_PATTERNS
-    for this run (changes shown as a diff from defaults).
-
-Validation on Resume:
-  - fact_packs.json must be valid JSON array.
-  - Each FactPack must have: finding.rule_id, finding.location,
-    build_context.include_paths.
-```
-
-### 3.9 Phase 2 — Source Exploration Interrupt
-
-```
-Interrupt point: before LLMOrchestrator enters the exploration phase
-                 (t < T_explore).
-
-Input shown:
-  spec.json   (VulnerabilitySpec — editable JSON)
-
-Controls:
-  [View / Edit spec.json]   CodeMirror JSON editor
-  Turn budget:
-    T_explore [___]   T_author [___]   T_max [___]   R_max [___]
-    (editable; changes apply to this spec only)
-
-User can:
-  - Edit entrypoint, assertion_template, suspect_calls, bounds_hints.
-  - Adjust T_explore budget before exploration starts.
-
-Validation on Resume:
-  - spec.json must satisfy VulnerabilitySpec schema.
-  - assertion_template must be non-empty.
-  - T_explore + T_author ≤ T_max.
-```
-
-### 3.10 Phase 2 — VulnerabilitySpec Selection Panel
-
-```
-Interrupt point: after Phase 1 completes, before Phase 2 dispatch begins.
-This panel applies at the Run level (not per-spec).
-
-A scrollable checklist of all VulnerabilitySpecs from Phase 1.
-
-┌─────────────────────────────────────────────────────────────────┐
-│  Select VulnerabilitySpecs to process in Phase 2                │
-│  ☑ Select all   ☐ Deselect all   [Filter...]                   │
-├──────┬──────────────────────────────────────┬──────────┬───────┤
-│  ☑   │  CWE-120 · elfxx-x86.c:2699          │  memcpy  │  [▼]  │
-│  ☑   │  CWE-416 · bfd.c:1140                │  free    │  [▼]  │
-│  ☐   │  CWE-476 · dwarf2.c:889              │  deref   │  [▼]  │
-│  ... (scrollable, all N specs)                                  │
-├─────────────────────────────────────────────────────────────────┤
-│  Selected: 1,258 / 1,260   Est. cost: ~$12.40 (Gemini Flash)   │
-└─────────────────────────────────────────────────────────────────┘
-
-[▼] expand row → shows full VulnerabilitySpec JSON in a
-    syntax-highlighted panel.
-    [Edit] opens the spec in an editable CodeMirror JSON panel.
-    Edits apply only to this run.
-
-Estimated cost display:
-  Based on avg 5K tokens/spec × price per 1M tokens of active provider.
-  Updates live as checkboxes are toggled.
-
-Validation on Resume:
-  - At least 1 spec must be selected.
-  - Any edited spec must satisfy VulnerabilitySpec schema.
-```
-
-### 3.11 Phase 2 — Driver Synthesis Interrupt
-
-```
-Interrupt point: after LLM produces the initial driver draft
-                 (first time driver.c is written).
-
-Input shown:
-  driver.c   (LLM-generated; editable)
-  spec.json  (read-only reference)
-
-Controls:
-  [View / Edit driver.c]   CodeMirror C editor (full syntax highlighting)
-  [Replace driver.c]       upload a handwritten driver
-
-User can:
-  - Edit the driver before it is compiled.
-  - Replace with a fully custom driver (bypasses LLM for this turn).
-
-Validation on Resume:
-  - driver.c must compile without errors in the container:
-      clang -O0 -g -emit-llvm -c <include_flags> driver.c
-    Server runs this check; shows clang stderr if it fails.
-    User can fix and retry validation inline without leaving the panel.
-```
-
-### 3.12 Phase 2 — Stub Synthesis Interrupt
-
-```
-Interrupt point: after StubSynthesizer produces the code slice draft.
-
-Input shown:
-  slice.c    (LLM-generated; editable)
-  stubs list (summary of which functions were stubbed, at what granularity)
-
-Controls:
-  [View / Edit slice.c]    CodeMirror C editor
-  Stub summary table:
-    Function          Granularity    Return value
-    bfd_get_32()      function       symbolic
-    bfd_put_32()      function       0
-    ...
-
-User can:
-  - Edit slice.c directly.
-  - Change stub return type from "symbolic" to "concrete value" inline.
-
-CWE-416 enforcement warning:
-  If any free() call is present and its stub does NOT call real free(),
-  a red warning banner appears:
-    "⚠ free() stub must call real free() for CWE-416 (paper §4.2).
-     Fix before resuming."
-  This warning blocks Resume until resolved.
-
-Validation on Resume:
-  - slice.c must compile (same check as §3.11).
-```
-
-### 3.13 Phase 2 — Compile & Diagnose Interrupt
-
-```
-Interrupt point: every time CompileDiagnose(H, P) returns a failure.
-
-Input shown:
-  Compiler output (clang/llvm-link stderr)
-  Error class badge: incomplete_type | conflicting_proto | redefinition | other
-  Suggested fix (auto-generated by CompileDiagnoser)
-  Relevant source snippet (if found)
-
-Controls:
-  [Apply suggested fix]    one-click applies the auto-fix to the affected file
-  [View / Edit driver.c]   CodeMirror C
-  [View / Edit slice.c]    CodeMirror C
-  [View / Edit stubs.c]    CodeMirror C
-
-User can:
-  - Apply the auto-fix as-is.
-  - Edit any harness file manually.
-  - Combine: apply fix, then manually adjust.
-
-Validation on Resume:
-  - Re-runs clang compilation check before accepting.
-  - If still failing: shows error inline; user must fix before Resume.
-```
-
-### 3.14 Phase 2 — KLEE Execution Interrupt
-
-```
-Interrupt point: before each klee invocation (every turn ≥ T_author).
-
-Input shown:
-  harness.bc   (linked bitcode; binary — hex dump only)
-  KLEE options currently configured:
-    search strategy, timeout, depth limit
-
-Controls:
-  KLEE options:
-    Search strategy  [random-path ▼] + [dfs ▼]  (multi-select)
-    Timeout          [300] s
-    Depth limit      [1000]
-  [View last KLEE output]   (if any previous run exists)
-  Coverage probes summary:
-    Entered: [func1, func2]    Missed: [func3]
-
-User can:
-  - Adjust KLEE options before this run.
-  - View previous KLEE output for diagnostic context.
-  Note: harness.bc itself cannot be edited here (it's binary).
-        To change harness: use §3.11 / §3.12 interrupt first.
-
-Validation on Resume:
-  - Timeout must be > 0 and ≤ 3600s.
-  - At least 1 search strategy selected.
-```
-
-### 3.15 Phase 2 — LLM Disable Mode (Manual Harness Generation)
-
-```
-Available when:
-  The "Disable LLM" button is pressed (distinct from Auto checkbox).
-  This disables LLM generation entirely for this spec.
-
-Effect:
-  Turn counter still increments.
-  At each turn where LLM would normally act, pipeline pauses instead.
-  User manually writes/edits driver.c, slice.c, assertions.c.
-  Then clicks "Submit manual harness" to proceed to compile + KLEE.
-
-UI:
-  Interrupt Panel shows a manual editor with three tabs:
-    [driver.c]  [slice.c]  [assertions.c]
-  Each tab is a full CodeMirror C editor.
-  "Submit manual harness" = equivalent to "Resume" in auto mode.
-
-This mode is intended for expert users who want full control over
-harness construction without LLM assistance.
-
-Re-enable LLM:
-  "Re-enable LLM" button restores auto generation for subsequent turns.
-  Previously submitted manual files are kept as the starting point.
-
-Validation on Submit:
-  - All three files must compile (same as §3.11).
-```
-
-### 3.16 Phase 3 — Replay Driver Generation Interrupt
-
-```
-Interrupt point: after ReplayDriverGenerator produces replay_driver.c.
-
-Input shown:
-  replay_driver.c   (editable)
-  witness_values:   (from .ktest — shown as human-readable table)
-    Variable      Type      Value (interpreted)
-    copy_size     size_t    17
-    dst_bytes     u8[16]    0x00 × 16
-    src_bytes     u8[512]   0x00 × 512
-
-Controls:
-  [View / Edit replay_driver.c]   CodeMirror C editor
-
-Critical validation (blocking):
-  - klee_make_symbolic, klee_assume, klee_assert, klee_warning_once
-    must NOT appear in replay_driver.c.
-  - Regular assignments (e.g., ndo->ndo_vflag = 3) must be present.
-  If the validator finds klee_* calls: red error with exact line numbers.
-  Resume blocked until fixed.
-
-Validation on Resume:
-  - replay_driver.c must compile with clang -fsanitize=address.
-```
-
-### 3.17 Phase 3 — ASan Compilation Interrupt
-
-```
-Interrupt point: before the project is recompiled with -fsanitize=address.
-
-Input shown:
-  ASan build command (derived from run config)
-  ASAN_OPTIONS (editable)
-
-Controls:
-  ASan build command  [___________________________________]
-  ASAN_OPTIONS        [halt_on_error=1:print_stacktrace=1]
-  ☑ Confirm unmodified project source is used
-    (checked by server: no LLM-generated files in compilation)
-
-User can:
-  - Adjust ASan build flags.
-  - Set ASAN_OPTIONS.
-
-Critical validation (blocking):
-  - The compilation must NOT include any LLM-generated stub files.
-  - Server checks that only project source files from the repository
-    are in the compile command.
-  If a stub file is detected: red error.
-  Resume blocked until fixed.
-```
-
-### 3.18 Phase 3 — Result Classification Interrupt
-
-```
-Interrupt point: after ConcreteExecutor returns the ASan output,
-                 before ResultClassifier assigns verdict.
-
-Input shown:
-  ASan output (full stderr — read-only, syntax-highlighted)
-  Stack trace parsed by ResultClassifier:
-    Frame  File               Function    Project source?
-    #0     elfxx-x86.c:2286   _bfd_...    ✅ YES
-    #1     replay_driver.c    main        ❌ NO (harness)
-
-Controls:
-  Proposed verdict:  [CONFIRMED ▼]  (editable dropdown)
-    Options: CONFIRMED | FALSE_POSITIVE | INCONCLUSIVE
-  Reason (optional free text):  [_____________________________]
-  Override CWE:  [CWE-122 ▼]
-
-User can:
-  - Accept the auto-classified verdict.
-  - Override the verdict manually with a reason.
-  - Override the CWE refinement.
-
-Validation on Resume:
-  - A verdict must be selected.
-  - If verdict = CONFIRMED but no project source frame in stack trace:
-    yellow warning (non-blocking):
-    "No project source frame detected. Confirm override intentional."
-```
-
-### 3.19 Input File Validation & Warning System
-
-Applies across ALL interrupt panels when a file is replaced or edited.
-
-```
-Structural validation rules by file type:
-
-  *.sarif / *.json with "runs" key:
-    → Must be valid JSON
-    → Must match SARIF 2.1.0 schema ("$schema" key or "runs" array)
-    → Warning if type mismatch: "Expected SARIF structure but got
-      { detected_format }. Proceeding may cause parser errors."
-
-  findings.json:
-    → Must be JSON array of SARIFFinding objects
-    → Each element: finding_id, rule_id, cwe, location.file,
-      location.line, description
-
-  fact_packs.json:
-    → Must be JSON array of FactPack objects
-    → Each element: finding (nested SARIFFinding), build_context
-
-  specifications.json / spec.json:
-    → Must satisfy VulnerabilitySpec schema
-    → assertion_template must be non-empty
-    → entrypoint must be non-empty string
-
-  *.c (driver, slice, stubs, replay_driver):
-    → Must be valid UTF-8 text
-    → Server-side: clang --syntax-only check
-    → Warning if klee_* symbols appear in replay_driver.c
-
-  *.ql:
-    → Server-side: codeql query compile --check-only
-    → Warning if query produces no results on the current DB
-
-  *.ktest:
-    → Must be binary file starting with "KTEST" magic bytes
-    → Warning if file is empty
-
-  *.bc (LLVM bitcode):
-    → Must start with "BC" magic bytes (0x42 0x43)
-    → View-only; cannot be replaced in interrupt panel
-
-Warning severity levels:
-  ERROR   (red, blocks Resume):
-    Structural validation failed. File will cause pipeline failure.
-  WARNING (yellow, non-blocking):
-    File is valid but may produce unexpected results.
-  INFO    (blue, non-blocking):
-    File replaced successfully. Original archived.
-
-Archive behavior:
-  When a file is replaced, the original is archived at:
-    <artifact_path>.replaced.<timestamp>.<original_extension>
-  This ensures the original is always recoverable.
-```
+When `enabled=true`:
+- For this spec only, the worker treats `phase2_driver_synthesis`,
+  `phase2_stub_synthesis`, and `phase2_compile_diagnose` as if their
+  `AutoConfig` were `false`, EVEN IF the run-level `AutoConfig` is `true`
+  for those functions.
+- Other specs in the run are unaffected.
+- Run-level `AutoConfig` is unchanged in the DB.
+- Re-queueing the spec preserves the flag (intentional — the typical
+  use case is "I want to take over this one spec").
+
+When `enabled=false` (default): no effect; AutoConfig governs as usual.
+
+This is **not** an SSE event because it's a per-spec state. The frontend
+reads it on spec detail page mount.
 
 ---
 
-## 4. Phase-End Download
+## 5. Phase-End Download
 
-Downloads are available at two moments:
-- **After a phase completes** (phase status = completed or confirmed).
-- **At an Interrupt Panel** when Auto = OFF (before the phase runs or
-  after the phase has generated the file but before the next step).
+### 5.1 Where downloads appear in the UI
 
-### 4.1 Download UI Placement
+Three surfaces, all backed by the same endpoints from §5.6:
 
-**A. Timeline event cards** (§4b of `frontend_spec.md`):
-Each phase completion event has a download button inline:
+**A. Timeline event cards** (`frontend_spec.md §4b`). Each phase
+   completion event shows inline download buttons:
 
 ```
 ✓ 14:02:11   Phase 1 complete — 1,260 specs
-              [↓ Download Phase 1 outputs]
+              [↓ Phase 1 outputs]
 
 ⚑ 14:09:42   Turn 24: bug_triggered
-              [↓ Download .ktest witness]
+              [↓ KLEE witness (.ktest)]
 
 ✓ 14:11:23   CONFIRMED: heap-buffer-overflow
-              [↓ Download Phase 3 outputs]  [↓ Download evidence package]
+              [↓ Phase 3 outputs]   [↓ Evidence package]
 ```
 
-**B. Artifacts pane** (§4c of `frontend_spec.md`):
-Individual file download buttons, plus phase-level "Download all" buttons.
+**B. Artifacts pane** (`frontend_spec.md §4c`). Per-file [Download]
+   buttons plus phase-level "Download all" buttons.
 
-**C. Interrupt Panel** (§3 above):
-Each input file row has an individual [↓ Download] button.
-A "Download all phase inputs" button at panel level.
+**C. Interrupt panel** (§4.11 above). Each input file row has a
+   [Download] button. A "Download all phase inputs" button at the panel
+   level downloads the union of `input_files`.
 
-### 4.2 Phase 1 Downloads
+### 5.2 Phase 1 download manifest
 
-Available after Phase 1 completes or at Fact Enrichment / Spec
-Generation interrupt points.
+Available after Phase 1 completes OR at any Phase 1 interrupt
+(snapshot of whatever the function has produced so far).
 
-| File | Description | Format |
-|------|-------------|--------|
-| `findings.sarif` | Raw CodeQL output | SARIF JSON |
-| `findings.json` | Parsed SARIFFinding list | JSON array |
-| `fact_packs.json` | Enriched FactPack list | JSON array |
-| `specifications.json` | Final VulnerabilitySpec list | JSON array |
-| `phase1_summary.json` | Statistics (counts, reduction rate, by CWE) | JSON |
-| `phase1_outputs.tar.gz` | All of the above in one archive | tarball |
+| File                       | Description                                  | Format         |
+| -------------------------- | -------------------------------------------- | -------------- |
+| `findings.sarif`           | Raw CodeQL output                            | SARIF JSON     |
+| `findings.json`            | Parsed `SARIFFinding` list                   | JSON array     |
+| `fact_packs.json`          | Enriched `FactPack` list                     | JSON array     |
+| `specifications.json`      | Final `VulnerabilitySpec` list (run-level)   | JSON array     |
+| `phase1_summary.json`      | Statistics — see `Phase1Summary` in schema   | JSON           |
+| `phase1_outputs.tar.gz`    | All of the above                             | tarball        |
 
-### 4.3 Phase 2 Downloads
+### 5.3 Phase 2 download manifest
 
-Available per-spec after Phase 2 completes (outcome = bug_triggered)
-or at KLEE Execution interrupt point.
+Available per-spec after Phase 2 reaches a terminal state OR at
+`phase2_klee_execution` interrupt.
 
-| File | Description | Format |
-|------|-------------|--------|
-| `klee-out/test*.ktest` | KLEE witness inputs | Binary (.ktest) |
-| `klee-out/messages.txt` | KLEE log output | Text |
-| `klee-out/test*.kquery` | Path constraint SMT queries | Text |
-| `driver.vN.c` | Final driver harness | C source |
-| `slice.vN.c` | Final code slice | C source |
-| `harness.bc` | Linked LLVM bitcode | Binary |
-| `outcome.json` | Phase 2 verdict + statistics | JSON |
-| `phase2_spec.tar.gz` | All Phase 2 artifacts for this spec | tarball |
+| File                                | Description                            | Format       |
+| ----------------------------------- | -------------------------------------- | ------------ |
+| `klee-out/test*.ktest`              | KLEE witness inputs                    | Binary       |
+| `klee-out/messages.txt`             | KLEE log output                        | Text         |
+| `klee-out/test*.kquery`             | Path constraint SMT queries            | Text         |
+| `driver.vN.c`                       | Each version of the driver harness     | C source     |
+| `slice.vN.c`                        | Each version of the code slice         | C source     |
+| `assertions.vN.c`                   | Each version of the assertion fragment | C source     |
+| `harness.bc`                        | Linked LLVM bitcode                    | Binary       |
+| `outcome.json`                      | Phase 2 outcome + statistics           | JSON         |
+| `phase2_spec.tar.gz`                | All of the above for this spec         | tarball      |
 
-Note: `.ktest` files are binary. The Interrupt Panel shows witness
-values as a human-readable table (see §3.14) but the download
-is the raw binary.
+### 5.4 Phase 3 download manifest
 
-### 4.4 Phase 3 Downloads
+Available per-spec after Phase 3 reaches a terminal state OR at
+`phase3_result_classification` interrupt.
 
-Available per-spec after Phase 3 completes or at Result Classification
-interrupt point.
+| File                       | Description                                  | Format       |
+| -------------------------- | -------------------------------------------- | ------------ |
+| `replay_driver.c`          | Concrete replay driver (`klee_*` stripped)   | C source     |
+| `asan_report.txt`          | Full ASan crash report                       | Text         |
+| `verified_bug.json`        | Final verdict; see `Verdict` schema type     | JSON         |
+| `phase3_spec.tar.gz`       | All of the above for this spec               | tarball      |
 
-| File | Description | Format |
-|------|-------------|--------|
-| `replay_driver.c` | Concrete replay driver (klee_* stripped) | C source |
-| `asan_report.txt` | Full AddressSanitizer crash report | Text |
-| `verified_bug.json` | Final verdict + CWE + ASan type + inputs | JSON |
-| `phase3_spec.tar.gz` | All Phase 3 artifacts for this spec | tarball |
+### 5.5 Evidence package (cross-phase)
 
-### 4.5 Evidence Package (cross-phase)
-
-Available after Phase 3 CONFIRMED. Contains one artifact per phase:
+Available after Phase 3 with `verdict="confirmed"`.
 
 ```
 evidence_<spec_id>/
   README.md               (auto-generated reproduction instructions)
   phase1/
-    spec.json             (VulnerabilitySpec)
+    spec.json
   phase2/
-    driver.c              (final harness driver)
-    slice.c               (final code slice)
-    witness.ktest         (KLEE witness)
-    path_constraints.txt  (human-readable constraint summary)
+    driver.c              (final version)
+    slice.c               (final version)
+    assertions.c          (final version, if any)
+    witness.ktest
+    path_constraints.txt
   phase3/
     replay_driver.c
     asan_report.txt
     verified_bug.json
 ```
 
-Download buttons:
-- Per-spec: "Download evidence package" in timeline and results table.
-- Bulk: "Export all confirmed bugs" on the Results tab.
-
-### 4.6 Download API Endpoints
+### 5.6 Download API endpoints
 
 ```
 # Phase 1 (run-level)
-GET  /api/runs/:run_id/phase1/artifacts
-GET  /api/runs/:run_id/phase1/artifacts/:filename
-GET  /api/runs/:run_id/phase1/artifacts.tar.gz
+GET  /api/runs/:run_id/phase1/artifacts                          [viewer+]
+GET  /api/runs/:run_id/phase1/artifacts/:filename                [viewer+]
+GET  /api/runs/:run_id/phase1/artifacts.tar.gz                   [viewer+]
 
 # Phase 2 (spec-level)
-GET  /api/runs/:run_id/specs/:spec_id/phase2/artifacts
-GET  /api/runs/:run_id/specs/:spec_id/phase2/artifacts/:filename
-GET  /api/runs/:run_id/specs/:spec_id/phase2/artifacts.tar.gz
+GET  /api/runs/:run_id/specs/:spec_id/phase2/artifacts           [viewer+]
+GET  /api/runs/:run_id/specs/:spec_id/phase2/artifacts/:filename [viewer+]
+GET  /api/runs/:run_id/specs/:spec_id/phase2/artifacts.tar.gz    [viewer+]
 
 # Phase 3 (spec-level)
-GET  /api/runs/:run_id/specs/:spec_id/phase3/artifacts
-GET  /api/runs/:run_id/specs/:spec_id/phase3/artifacts/:filename
-GET  /api/runs/:run_id/specs/:spec_id/phase3/artifacts.tar.gz
+GET  /api/runs/:run_id/specs/:spec_id/phase3/artifacts           [viewer+]
+GET  /api/runs/:run_id/specs/:spec_id/phase3/artifacts/:filename [viewer+]
+GET  /api/runs/:run_id/specs/:spec_id/phase3/artifacts.tar.gz    [viewer+]
 
-# Evidence package
-GET  /api/runs/:run_id/specs/:spec_id/evidence.tar.gz
-GET  /api/runs/:run_id/results/evidence-all.tar.gz
-
-All file responses:
-  - Return presigned redirect (HTTP 302) to artifact store URL.
-  - Presigned URL valid for 300 seconds.
-  - Content-Disposition: attachment; filename="<original_filename>"
+# Evidence
+GET  /api/runs/:run_id/specs/:spec_id/evidence.tar.gz            [viewer+]
+GET  /api/runs/:run_id/results/evidence-all.tar.gz               [viewer+]
 ```
+
+Response contract:
+- **List endpoints** (`/artifacts` without filename) return:
+  ```
+  { items: [{ name, size_bytes, mime_type, created_at, artifact_ref }] }
+  ```
+  NOT a tree with presigned URLs. The client requests presigned URLs
+  per file on demand (consistent with `CLAUDE_backend.md` Constraint 10).
+- **Individual file endpoints** return **HTTP 302** with a `Location`
+  header pointing to a presigned URL (TTL 300s). Backend MUST NOT
+  stream the bytes through the FastAPI process.
+- **Tarball endpoints** with reasonable size (e.g. all Phase 1 for one
+  run, ≤ 100MB) may return 302 to a pre-built tarball if it exists, or
+  enqueue an `export_task` and return 202 with a job_id (see
+  `backend_spec.md §4.4`). Caller polls `GET /api/jobs/:job_id` for the
+  resulting artifact_ref, then GETs that for the 302.
+- `Content-Disposition: attachment; filename="<original_filename>"` is
+  set on the presigned URL via S3/MinIO query parameters.
+
+### 5.7 Snapshot semantics during a running run
+
+Downloads taken during a run are **snapshots of the current artifact
+store state**. The endpoint returns whatever files exist at the moment
+of the request. Versioned files (`driver.v3.c` etc.) accumulate; older
+versions remain accessible.
+
+A download taken from an interrupt panel is a snapshot of inputs the
+function will consume IF the user clicks Resume. If the user uploads
+new files via §4.8 before resuming, the next download reflects the new
+files.
 
 ---
 
-## 5. Backend API Additions
+## 6. State persistence and recovery
 
-These endpoints are required by §3 and §4 but are not in
-`spec/backend_spec.md`. Add them there.
+### 6.1 Storage (backend implementation, not part of the wire contract)
 
-### 5.1 Auto Mode Control
+Implementation details belong in `CLAUDE_backend.md`. This spec defines
+the **observable state** via the schema's `InterruptPoint`, `AutoConfig`,
+and `ManualHarnessMode` types, plus the endpoints in §4.4 / §4.5 / §4.12.
 
-```
-GET   /api/runs/:run_id/auto-config
-      Returns: { phase1: {...}, phase2: {...}, phase3: {...} }
-      Each function → boolean (auto=true/false)
+How the backend stores these (PostgreSQL tables, Redis state, etc.) is
+not specified here. The contract is:
+- An interrupt's state survives backend restart.
+- An interrupt's `status` transitions are atomic
+  (`waiting → resumed | skipped`, terminal).
+- `AutoConfig` and `ManualHarnessMode` survive restart.
+- All state-changing actions write an `AuditEvent` (§4.4, §4.5).
 
-PATCH /api/runs/:run_id/auto-config
-      Body: { "phase2.klee_execution": false }
-      Effect: takes effect at next occurrence of that function.
-      Requires: operator role.
-```
+### 6.2 Browser refresh behavior
 
-### 5.2 Interrupt Panel State
+After a refresh, the UI:
+1. Restores the AutoConfig sidebar via `GET /api/runs/:run_id/auto-config`.
+2. Restores the waiting interrupts list via
+   `GET /api/runs/:run_id/interrupts?status=waiting`.
+3. Reconnects SSE; on reconnect, the server replays missed events from
+   the 60s buffer (per the shared SSE contract). If gap > 60s, the
+   server emits `resync_required` and the client refetches.
 
-```
-GET   /api/runs/:run_id/interrupts
-      Returns list of active interrupt points waiting for user action.
+### 6.3 Run cancellation while interrupts are waiting
 
-GET   /api/runs/:run_id/interrupts/:interrupt_id
-      Returns: function name, input files (with presigned URLs), status.
-
-POST  /api/runs/:run_id/interrupts/:interrupt_id/resume
-      Body: { modified_files: [{name, content_base64}],
-              option_overrides: {...} }
-      Effect: pipeline resumes with provided inputs.
-      Requires: intervener role.
-
-POST  /api/runs/:run_id/interrupts/:interrupt_id/skip
-      Effect: skips the function, uses default/previous outputs.
-      Requires: intervener role.
-```
-
-### 5.3 File Validation
-
-```
-POST  /api/validate/file
-      Body: { filename: str, content_base64: str }
-      Returns: { valid: bool, severity: "error"|"warning"|"info",
-                 message: str, detected_format: str }
-      Used by Interrupt Panel before allowing Resume.
-      Public endpoint (no auth required — validation is stateless).
-```
-
-### 5.4 User Registration
-
-```
-POST  /api/auth/register
-      Body: { username, email, password, display_name? }
-      Returns: { user_id, username, role: "viewer" }
-      Public endpoint.
-
-GET   /api/users                    [admin]
-POST  /api/users/:user_id/role      [admin]
-      Body: { role: "viewer"|"operator"|"intervener"|"admin" }
-DELETE /api/users/:user_id          [admin]
-```
+When a run is cancelled (POST `/api/runs/:id/cancel`):
+- All `InterruptPoint`s with `status="waiting"` for this run transition
+  to `status="skipped"` with `resolved_by="system"`.
+- An `interrupt_resolved` event is emitted per affected interrupt
+  (with `resolution="skipped"` and a special `resolved_by="system"`
+  to let the UI distinguish from user-initiated skips).
+- Worker tasks observe the cancel flag at the next turn boundary and
+  exit cooperatively (per `backend_spec.md §7.2`).
 
 ---
 
-## 6. Interrupt State Persistence
+## 7. SSE topic subscriptions for interactive control
 
-Interrupt state must survive backend restarts and browser refreshes.
+The frontend subscribes to these topics depending on the route. All
+topics conform to `SSETopicPattern` in the schema.
 
 ```
-Storage:
-  Interrupt points stored in PostgreSQL interrupt_points table.
-  Schema:
-    interrupt_id    UUID
-    run_id          FK → runs
-    spec_id         FK → specs (nullable for run-level interrupts)
-    function_name   str (e.g. "phase2.klee_execution")
-    phase           int (1|2|3)
-    turn            int (nullable)
-    status          "waiting" | "resumed" | "skipped"
-    created_at      timestamp
-    resumed_at      timestamp (nullable)
-    modified_files  JSONB (list of {name, artifact_path})
-    option_overrides JSONB
+/runs/:run_id (Run Detail page)
+  subscribes:  runs.<run_id>
+               runs.<run_id>.specs
+  receives:    run_status_changed, run_counters_updated,
+               spec_state_changed,
+               interrupt_created, interrupt_resolved,
+               auto_config_changed
 
-SSE push event on interrupt:
-  {kind: "interrupt_created",
-   interrupt_id: ...,
-   run_id: ...,
-   spec_id: ...,
-   function_name: ...}
+/runs/:run_id/interrupts (Interrupts list page)
+  subscribes:  runs.<run_id>
+  receives:    interrupt_created, interrupt_resolved, auto_config_changed
 
-Browser notification:
-  If the user is not on the relevant spec page:
-    → Toast notification: "⏸ Spec X paused at Phase 2 KLEE Execution"
-    → Clicking navigates to the spec detail page, Interrupt Panel open.
+/runs/:run_id/interrupts/:interrupt_id (Single interrupt panel)
+  subscribes:  runs.<run_id>
+  receives:    interrupt_resolved (in case another user resumed/skipped it)
+               interrupt_created (only for related interrupts of the same run)
+
+/runs/:run_id/specs/:spec_id (Spec detail)
+  subscribes:  runs.<run_id>.specs.<spec_id>
+               runs.<run_id>.specs.<spec_id>.logs
+  receives:    spec_state_changed (for this spec),
+               turn_appended,
+               log_line,
+               interrupt_created / interrupt_resolved (for this spec)
 ```
+
+Topic-level access control: viewers may subscribe to any topic in a run
+they can read. Interrupt-related events are not restricted further — the
+events themselves do not contain secrets (artifact_refs require a follow-up
+GET to access content, which goes through the per-artifact access check).
 
 ---
 
-## 7. Open Questions
+## 8. Audit log entries
 
-```
-1. Concurrent interrupts.
-   If 128 specs reach a KLEE Execution interrupt simultaneously,
-   the user faces 128 open interrupt panels.
-   Mitigation options:
-     a) Queue interrupts; user works through them one at a time.
-     b) "Apply to all matching" — bulk resume with same options.
-     c) Auto-skip after timeout (configurable per function).
-   Decision needed before implementation.
+Every state-changing action in this document writes an `AuditEvent`
+(see `AuditEvent.action` enum in the schema, extended to include the
+new values):
 
-2. Interrupt on re-run.
-   If Auto = OFF was set, and the spec is re-queued,
-   does the interrupt fire again?
-   Proposed: yes — re-queue resets interrupt state for that spec.
+| Action                | Written when                                             | `target`        | `diff` shape                                              |
+| --------------------- | -------------------------------------------------------- | --------------- | --------------------------------------------------------- |
+| `interrupt_resume`    | POST `.../interrupts/:id/resume` returns 200             | `interrupt:<id>`| `{ modified_files: [...], option_overrides: {...} }`      |
+| `interrupt_skip`      | POST `.../interrupts/:id/skip` returns 200               | `interrupt:<id>`| `{ reason: string \| null }`                              |
+| `auto_config_change`  | PATCH `.../auto-config` returns 200                      | `run:<id>`      | `{ before: AutoConfig, after: AutoConfig }`               |
+| `file_replace`        | POST `.../interrupts/:id/files` returns 200              | `interrupt:<id>`| `{ name: string, previous_artifact_ref, new_artifact_ref }`|
+| `user_register`       | POST `/api/auth/register` returns 201 (account created)  | `user:<id>`     | `{ username: string, role: UserRole }`                    |
+| `role_change`         | POST `/api/users/:id/role` returns 200                   | `user:<id>`     | `{ before: UserRole, after: UserRole }`                   |
 
-3. Query editor persistence.
-   Modified queries live for one run. Should they be saveable
-   as named query variants in the query catalog?
+Bulk operations (`apply_to_all_matching=true`) write **one audit event
+per affected interrupt**, not one for the bulk request. This makes the
+audit log queryable by interrupt without special-casing.
 
-4. Mobile / narrow viewport.
-   Interrupt Panel is a full-screen overlay on desktop.
-   On mobile (< 768px), the code editors may be unusable.
-   Proposed: interrupt panels are desktop-only; mobile shows
-   read-only view with "Resume" and "Skip" buttons only.
+---
 
-5. Interrupt panel for Phase 1 at run level.
-   Phase 1 runs once per run (not per spec). The interrupt panel
-   for Phase 1 functions blocks the entire run, not just one spec.
-   This is more disruptive than Phase 2/3 spec-level interrupts.
-   Consider a separate "Run-level interrupt" UI vs "Spec-level interrupt".
-```
+## 9. Backwards-compatibility rules
+
+Following `backend_spec.md §14`:
+
+- Adding new `PipelineFunctionId` values is a **non-breaking change**
+  (clients tolerate unknown enum values per backend §14). UI must hide
+  unknown function names from the AutoConfig sidebar rather than crash.
+- Adding new SSE `kind` values is a non-breaking change. Clients ignore
+  unknown kinds (frontend's exhaustive switch should fall through to a
+  no-op default for forward compat in production builds — TypeScript's
+  exhaustiveness check is a development-time aid).
+- Removing or renaming a `PipelineFunctionId` is **breaking** and
+  requires an API version bump.
+
+---
+
+## 10. Removed sections (compared to v1 of this document)
+
+The following content from v1 was moved or eliminated:
+
+| v1 location                                              | Disposition                                                       |
+| -------------------------------------------------------- | ----------------------------------------------------------------- |
+| v1 §6 "Interrupt state persistence" with table schema    | Moved to `CLAUDE_backend.md` (storage implementation detail).     |
+| v1 §3.18 verdict enum `CONFIRMED \| FALSE_POSITIVE \| INCONCLUSIVE` | Replaced by `VerdictValue` lowercase enum; `INCONCLUSIVE` removed (Phase 3 only has confirm/reject — inconclusive is a Phase 2 outcome). |
+| v1 §3.15 "LLM Disable Mode" embedded in interrupt list   | Promoted to §4.12 — a config flag, not an interrupt.              |
+| v1 §5.1 "Auto Mode Control" with dotted-key body         | Replaced by §4.4 with flat snake_case keys (`AutoConfigPatch`).   |
+| v1 §5.2 endpoints with `content_base64` body             | Replaced by §4.5 two-step upload-then-resume flow.                |
+| v1 §5.3 "/api/validate/file" with inline `content_base64`| Replaced by §4.5 multipart upload; same `FileValidationResult` shape. |
+| v1 §7 five open questions                                | All resolved in v2: §4.2 (OQ-5), §4.3 (OQ-1), §6.3 (OQ-2), §4.12 (related to OQ-3). OQ-4 (mobile) and OQ-3 (query persistence) folded into §11. |
+
+---
+
+## 11. Deferred for future iterations
+
+The following are intentionally not in MVP:
+
+- **Mobile viewport** (formerly v1 OQ-4). Interrupt panels are
+  desktop-only (≥ 1024px). On smaller viewports, the panel route
+  redirects to a read-only summary with [Resume with defaults] and
+  [Skip] buttons; no inline editors.
+- **Auto-skip timeout** (formerly part of v1 OQ-1). Could be added as
+  an `AutoConfig` value alongside `boolean` (e.g. `{ auto: false,
+  skip_after_seconds: 600 }`). Not in MVP.
+- **Saveable modified queries** (formerly v1 OQ-3). For now, modified
+  `.ql` files are run-scoped only. A future iteration may add a query
+  catalog API to persist variants.
+- **Cross-run dedup of interrupts**. A future iteration could surface
+  "this function paused in 3 previous runs of this project" as
+  decision support. Out of scope here.
+
+---
+
+## 12. Implementation checklist (for Code)
+
+When implementing this spec, the order is:
+
+1. Verify `shared/contracts/sailor.schema.json` contains all 14 of:
+   `PipelineFunctionId`, `InterruptScope`, `InterruptStatus`,
+   `InterruptPoint`, `InterruptInputFile`, `InterruptResumeRequest`,
+   `InterruptSkipRequest`, `AutoConfig`, `AutoConfigPatch`,
+   `FileValidationResult`, `FileValidationSeverity`,
+   `InterruptCreatedPayload`, `InterruptResolvedPayload`,
+   `AutoConfigChangedPayload`, `ManualHarnessMode`, `RegisterRequest`,
+   `RegisterResponse`, `ClassifyVerdictRequest`. (Yes, that's the list —
+   if any are missing, run `./scripts/regen_contracts.sh` first.)
+2. Backend: implement the endpoints in §4.4, §4.5, §3.1, §3.4, §4.12,
+   §5.6 using the imported Pydantic models. Do not redeclare any of
+   them.
+3. Backend: in workers, replace the abstract "function boundary check"
+   from `backend_spec.md §7.2` with the concrete check: for each
+   `PipelineFunctionId`, immediately before the function runs, query
+   `AutoConfig`; if false, write an `InterruptPoint`, emit
+   `interrupt_created`, and block until the row transitions out of
+   `waiting` (poll or pub/sub).
+4. Frontend: implement the `pipelineLabels.ts` map from
+   `PipelineFunctionId` to display strings. This is the only place
+   display labels live.
+5. Frontend: implement the InterruptList page and the InterruptPanel
+   component (single component, parameterized by `function_name`). The
+   panel reads `option_overrides`'s schema from `pipelineLabels.ts`'s
+   companion `pipelineOptionSchemas.ts` (a per-function form schema).
+6. Frontend: subscribe to the topics listed in §7 per route, and
+   dispatch the three new SSE kinds in `useSSE.ts`.
+7. Add interrupt scenarios to integration tests (one per
+   `PipelineFunctionId` × `(resume happy path, skip path, file
+   validation error, version mismatch, bulk apply)`).

@@ -18,8 +18,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from codeql.wrapper import CodeQLError, CodeQLRunner
-from models.schemas import BuildContext, Location, SARIFFinding, TraceStep
+from sailor.codeql.wrapper import CodeQLError, CodeQLRunner
+from sailor.models.schemas import BuildContext, Location, SARIFFinding, TraceStep
 from sailor.codeql.queries import CodeQLQuerySuite
 
 logger = logging.getLogger("sailor.phase1.fact_generation")

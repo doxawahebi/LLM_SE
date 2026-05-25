@@ -1,0 +1,64 @@
+services:
+
+  # ── Message broker ─────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    networks: [sailor_net]
+
+  # ── Result database ────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: sailor
+      POSTGRES_USER: sailor
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    networks: [sailor_net]
+
+  # ── Celery worker ──────────────────────────────────────────────────────────
+  worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.worker
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      DB_PATH: /data/output/evaluation.db
+      OUTPUT_BASE: /data/output
+    volumes:
+      - workspace_data:/data/workspace        # target source (per CVE)
+      - output_data:/data/output              # phase results + DB
+      - /var/run/docker.sock:/var/run/docker.sock  # spawn runner containers
+      - ../sailor/codeql/queries:/sailor-queries:ro  # custom CodeQL queries
+    depends_on: [redis, postgres]
+    networks: [sailor_net]
+    restart: unless-stopped
+
+  # ── Web API (optional, shares worker image) ────────────────────────────────
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.worker
+    command: ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      DB_PATH: /data/output/evaluation.db
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+    volumes:
+      - output_data:/data/output
+    depends_on: [worker]
+    networks: [sailor_net]
+
+volumes:
+  db_data:
+  workspace_data:
+  output_data:
+
+networks:
+  sailor_net:
+    driver: bridge

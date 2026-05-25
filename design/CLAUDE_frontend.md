@@ -7,6 +7,12 @@
 
 ---
 
+> **Type definitions are NOT in this file.**
+> Every shared type lives in `shared/contracts/sailor.types.ts`,
+> generated from `shared/contracts/sailor.schema.json`. Import; do not
+> redefine. If you see a discrepancy between this file and the schema,
+> the schema wins — open an issue and fix this file.
+
 ## Spec Evaluation: What Is Missing or Needs Clarification
 
 The uploaded `frontend_spec.md` is comprehensive. The following gaps
@@ -59,17 +65,38 @@ Rationale: lightweight, extensible, handles 100K-line files with
            progressive syntax highlighting
 ```
 
-### Gap 4: SSE Client Implementation (sketched, not defined)
+### Gap 4: SSE Client Implementation
+
+Wire format is defined by `shared/contracts/sailor.schema.json`
+(`SSEMessage`, `SSEBatch`). Frontend MUST NOT diverge.
 
 ```
-Decision: custom useSSE() hook with reconnect + sequence tracking
+Decision: custom useSSE() hook on top of native EventSource
 
-Behavior:
-  - Subscribes with ?topics=runs.{id}.specs on mount
-  - On disconnect: exponential backoff (1s, 2s, 4s, max 30s)
-  - On reconnect: sends ?since={last_seq} to catch up
-  - Batched diffs: server sends {seq, diffs: [{spec_id, patch}]}
-  - Client applies JSON Merge Patch (RFC 7386) to useSpecStore
+Connection:
+  - URL: `/api/events?topics=<comma-separated>&token=<jwt>`
+    (browser EventSource cannot send Authorization headers — token
+    must be a query parameter. Backend validates the same as a header.)
+  - Topics format: see `SSETopicPattern` in the schema.
+
+Reconnect:
+  - Native EventSource handles reconnect; on each reconnect it sends
+    the `Last-Event-ID` HTTP header automatically. The server uses
+    this to replay from the 60-second buffer.
+  - If the server sends `{kind: "resync_required"}`, the client drops
+    its local store for that topic and refetches via REST.
+
+Payload handling:
+  - Each `SSEMessage` carries a full snapshot in `payload` — NOT a
+    JSON Merge Patch. Frontend replaces by `spec_id`/`run_id`, not
+    merges. Anything still using RFC 7386 is wrong; delete it.
+  - Batches (`SSEBatch`) wrap multiple messages within a 250ms window.
+    Process them in order; the batch's `sequence` is the last message's
+    sequence (not a separate counter).
+
+Dispatch:
+  - Use a `switch (msg.kind)` exhaustively. TypeScript's discriminated
+    union will warn if a case is missing.
 ```
 
 ### Gap 5: Open Questions Resolution (§14 of spec)
@@ -142,7 +169,7 @@ Multi-stage build: development 모드와 production 모드 모두 지원.
 FROM node:20-alpine AS development
 WORKDIR /app
 COPY package*.json ./
-RUN npm ci
+RUN npm install --frozen-lockfile || npm install
 COPY . .
 EXPOSE 3000
 CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0", "--port", "3000"]
@@ -151,7 +178,7 @@ CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0", "--port", "3000"]
 FROM node:20-alpine AS build
 WORKDIR /app
 COPY package*.json ./
-RUN npm ci
+RUN npm install --frozen-lockfile || npm install
 COPY . .
 RUN npm run build          # outputs to /app/dist
 
@@ -162,6 +189,9 @@ COPY nginx.conf /etc/nginx/conf.d/default.conf
 EXPOSE 80
 CMD ["nginx", "-g", "daemon off;"]
 ```
+
+> Note: `npm install --frozen-lockfile || npm install` is used instead of `npm ci`
+> to handle missing lock-file edge cases during local development.
 
 ```nginx
 # frontend/nginx.conf
@@ -195,16 +225,26 @@ The API base URL is injected as an environment variable. Fixed at Vite build tim
 ```typescript
 // vite.config.ts
 import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+import path from 'path'
 
 export default defineConfig({
+  plugins: [react()],
+  resolve: {
+    alias: {
+      '@': path.resolve(__dirname, './src'),
+    },
+  },
   server: {
     proxy: {
       '/api': {
-        target: process.env.VITE_API_URL ?? 'http://backend:8000',
+        // 'http://localhost:8000' for local dev (outside Docker)
+        // VITE_API_URL=http://backend:8000 inside Docker network
+        target: process.env.VITE_API_URL ?? 'http://localhost:8000',
         changeOrigin: true,
-      }
-    }
-  }
+      },
+    },
+  },
 })
 ```
 
@@ -305,132 +345,52 @@ frontend/src/
 
 ---
 
-## TypeScript Interfaces (mirrors API schema)
+## TypeScript Types — DO NOT REDEFINE HERE
 
-```typescript
-// lib/types.ts
+All types that cross the API boundary live in `shared/contracts/sailor.types.ts`,
+generated from `shared/contracts/sailor.schema.json`. Frontend code MUST
+import from there:
 
-export type RunStatus =
-  | "queued" | "running" | "paused" | "completed" | "failed" | "cancelled"
-  | "needs_build_config";
-
-export type Phase2Status =
-  | "queued" | "exploring" | "authoring" | "refining"
-  | "bug_triggered" | "inconclusive" | "likely_false_positive";
-
-export type Phase3Status =
-  | "queued" | "running" | "confirmed" | "rejected" | "skipped";
-
-export type Verdict =
-  | "CONFIRMED" | "inconclusive" | "likely_false_positive" | "rejected" | null;
-
-export interface Run {
-  id: string;
-  name: string;
-  status: RunStatus;
-  created_at: string;
-  started_at: string | null;
-  completed_at: string | null;
-  project_ref: string;
-  config: RunConfig;
-  counters: RunCounters;
-}
-
-export interface RunCounters {
-  total_specs: number;
-  phase1_done: number;
-  phase2_done: number;
-  phase3_done: number;
-  bug_triggered: number;
-  confirmed: number;
-  inconclusive: number;
-  likely_fp: number;
-  error: number;
-  token_cost_usd: number;
-}
-
-export interface RunConfig {
-  build_command: string | null;
-  codeql_build_mode: "autodetect" | "none" | "custom";
-  query_ids: string[];
-  T_explore: number;
-  T_author: number;
-  T_max: number;
-  T_klee: number;
-  R_max: number;
-  parallelism: number;
-  llm_provider: string;
-  llm_model: string;
-  run_phase3: boolean;
-}
-
-export interface Spec {
-  id: string;
-  run_id: string;
-  rule_id: string;
-  cwe: string;
-  file: string;
-  line: number;
-  func: string;
-  message: string;
-  snippet: string;
-  phase1_status: "emitted" | "filtered";
-  phase2_status: Phase2Status | null;
-  phase3_status: Phase3Status | null;
-  verdict: Verdict;
-  current_turn: number | null;
-  error_class: string | null;
-  token_cost: number;
-  last_updated: string;
-}
-
-export interface Turn {
-  turn_number: number;
-  kind: "explore" | "author" | "compile_fail" | "klee_run" | "refinement"
-      | "intervention" | "klee_timeout";
-  started_at: string;
-  duration_ms: number;
-  payload: TurnPayload;
-}
-
-export type TurnPayload =
-  | LLMTurnPayload
-  | CompileFailPayload
-  | KleeRunPayload
-  | ArtifactWritePayload;
-
-export interface LLMTurnPayload {
-  kind: "explore" | "author" | "refinement";
-  prompt_tokens: number;
-  completion_tokens: number;
-  tool_calls: ToolCall[];
-  response_summary: string;
-}
-
-export interface CompileFailPayload {
-  kind: "compile_fail";
-  error_class: "incomplete_type" | "conflicting_proto" | "redefinition" | "other";
-  raw_error: string;
-  suggested_fix: string;
-  relevant_source?: string;
-}
-
-export interface KleeRunPayload {
-  kind: "klee_run";
-  outcome: "not_reached" | "site_reached" | "bug_triggered";
-  paths_explored: number;
-  functions_entered: string[];
-  functions_missed: string[];
-  ktest_paths: string[];
-  stderr_excerpt: string;
-}
-
-export interface SSEDiff {
-  seq: number;
-  topic: string;
-  diffs: Array<{ id: string; patch: Partial<Spec | Run> }>;
-}
+```ts
+import type {
+  Run, Spec, Turn, TurnDetail, Verdict,
+  RunStatus, Phase2Status, Phase3Status,
+  RunConfig, RunCounters,
+  SSEMessage, SSEBatch, SSEMessageKind,
+  InterventionRequest, EditHarnessRequest, ForceOutcomeRequest, EditSpecRequest,
+  ApiError, PaginatedSpecs,
+} from "@/shared/contracts/sailor.types";
 ```
+
+There must be no `lib/types.ts` redefining these. If you find yourself
+typing `export type RunStatus =` anywhere in the `frontend/` tree, stop
+and import instead.
+
+The contracts directory's `README.md` documents every contract decision
+that was previously ambiguous (SSE envelope, RunCounters field names,
+RunConfig naming, Verdict casing, intervention discriminators). Read it
+before disagreeing with any field name.
+
+### Frontend-only types
+
+Some types are **purely UI state** and never cross the API. Those may
+live in `frontend/src/lib/ui-types.ts`:
+
+```ts
+// frontend/src/lib/ui-types.ts
+export type FilterPreset = { name: string; filters: SpecFilters };
+export type SpecFilters = {
+  phase?: 1 | 2 | 3;
+  status?: string;
+  cwe?: string;
+  fileGlob?: string;
+  verdict?: string;
+  search?: string;
+};
+export type ToastSeverity = "info" | "success" | "warning" | "error";
+```
+
+These never appear in network payloads.
 
 ---
 
@@ -557,9 +517,16 @@ Phase A — Foundation (do first, everything depends on this)
 
   Step A3. Implement api/client.ts.
            → axios instance with baseURL from VITE_API_URL env var
-           → Auth token injection (Bearer from localStorage)
-           → 401 → redirect to login
-           → Error normalization: {code, message, detail}
+           → Auth token injection: Authorization: Bearer <jwt>
+             (from localStorage), on every request EXCEPT EventSource —
+             see Gap 4 for SSE auth.
+           → On every POST/PATCH/DELETE: inject
+             `Idempotency-Key: <uuid-v4>` (generate one per logical
+             intent; on user retry of the same intent, reuse the same
+             key so the backend short-circuits).
+           → 401 → redirect to /login
+           → Non-2xx responses are typed as `ApiError`
+             (from `shared/contracts/sailor.types`). Do not redefine.
 
   Step A4. Implement hooks/useSSE.ts.
            → Subscribes to SSE topics: runs.all, runs.{id}, etc.
@@ -644,8 +611,13 @@ Phase C — Spec Detail (/runs/:run_id/specs/:i)
            → InterruptPanel.tsx (base) + all 15 function-specific variants
                (see New Component Implementation Details above)
            → InterruptFileRow.tsx + FileValidationBanner.tsx
-           → Interrupt notification: SSE event → toast → navigate
-               ("interrupt_created" event on runs.{run_id} topic)
+           → Interrupt notification: SSE event → toast → navigate.
+             The interrupt event kind is NOT yet defined in
+             shared/contracts/sailor.schema.json. Until the interrupt
+             contract is added there, this UI is deferred — see the
+             contracts README "What is NOT in this schema (yet)".
+             Do not invent an `interrupt_created` event name; that
+             string has no backend support.
            → PipelineControlsSidebar.tsx with AutoCheckbox per function
                (add to Run Detail page as collapsible panel)
 

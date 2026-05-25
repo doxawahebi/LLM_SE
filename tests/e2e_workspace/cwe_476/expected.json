@@ -1,0 +1,32 @@
+{
+  "id": "E2E-CWE-476",
+  "cwe": "CWE-476",
+  "description": "Null pointer dereference: p->x accessed without null check",
+  "target": {
+    "file": "target.c",
+    "func": "vulnerable",
+    "line": 6
+  },
+  "phase1": {
+    "must_detect": true,
+    "expected_rule_id": "cpp/cwe-476",
+    "expected_assertion_template": "p != NULL before *p",
+    "min_findings": 1
+  },
+  "phase2": {
+    "expected_outcome": "bug_triggered",
+    "max_turns": 20,
+    "witness_symbolic_vars": ["p"],
+    "witness_must_violate": "p == NULL"
+  },
+  "phase3": {
+    "expected_verdict": "CONFIRMED",
+    "expected_asan_type": "unknown",
+    "crash_must_be_in_file": "target.c"
+  },
+  "performance": {
+    "max_wall_seconds": 120,
+    "max_llm_tokens": 50000,
+    "max_klee_paths": 500
+  }
+}

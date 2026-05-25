@@ -1,0 +1,24 @@
+{
+  "rule_id": "cpp/cwe-476/null-pointer-dereference",
+  "cwe": "CWE-476",
+  "file": "/home/cks/Project/SE-LLM-project/tests/e2e_workspace/cwe_476/target.c",
+  "line": 6,
+  "col": 12,
+  "message": "Null pointer dereference: p is dereferenced without a null check",
+  "snippet": "return p->x;           /* ← ℓ  null deref when p == NULL */",
+  "trace": [],
+  "suspect_calls": [],
+  "pointer_vars": [],
+  "length_vars": [],
+  "bounds_hints": [
+    "include <stdlib",
+    "h>\n\ntypedef",
+    "p == NULL"
+  ],
+  "build_context": {
+    "include_paths": [],
+    "defines": []
+  },
+  "entrypoint": "vulnerable",
+  "assertion_template": "p != NULL before *p"
+}

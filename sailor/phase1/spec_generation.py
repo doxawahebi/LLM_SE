@@ -15,7 +15,10 @@ import logging
 import re
 from pathlib import Path
 
-from models.schemas import FactPack, VulnerabilitySpec
+import tree_sitter_c as tsc
+from tree_sitter import Language, Parser
+
+from sailor.models.schemas import FactPack, VulnerabilitySpec
 
 logger = logging.getLogger("sailor.phase1.spec_generation")
 
@@ -160,20 +163,31 @@ class SpecificationGenerator:
         """Determine the entry-point function name for symbolic execution.
 
         Strategy (Phase 1):
-          • If the SARIF description or rule message names a specific function,
-            use it.
-          • Otherwise, set ``"LLM_INFER"`` so Phase 2 can resolve it via source
-            exploration (per CLAUDE.md §3.2 entry-point selection).
+          1. Regex on SARIF description for "... in funcName()".
+          2. Tree-sitter: find the C function enclosing the finding line.
+          3. Fallback: ``"LLM_INFER"`` so Phase 2 resolves via source exploration.
 
         Phase 2 LLM always has the opportunity to override this value.
         """
-        # The finding description sometimes contains "... in funcName()"
+        # 1. Description regex
         desc = pack.finding.description
         m = re.search(r"\bin\s+(\w+)\s*\(", desc)
         if m:
             candidate = m.group(1)
             if not _function_is_skipped(candidate):
                 return candidate
+
+        # 2. Tree-sitter enclosing-function extraction
+        src_path = Path(pack.finding.location.file)
+        vuln_line = pack.finding.location.line
+        if src_path.is_file():
+            try:
+                source = src_path.read_text(encoding="utf-8", errors="replace")
+                func_name = _extract_enclosing_function_name(source, vuln_line)
+                if func_name and not _function_is_skipped(func_name):
+                    return func_name
+            except Exception:
+                pass
 
         return "LLM_INFER"
 
@@ -182,10 +196,6 @@ class SpecificationGenerator:
         payload = [s.model_dump() for s in specs]
         out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         logger.info("Wrote %s (%d specifications).", out, len(specs))
-
-    # ------------------------------------------------------------------
-    # Alternative: load from existing specifications.json
-    # ------------------------------------------------------------------
 
     @classmethod
     def load(cls, output_dir: Path) -> list[VulnerabilitySpec]:
@@ -205,3 +215,44 @@ class SpecificationGenerator:
             raise FileNotFoundError(f"specifications.json not found at {path}")
         raw = json.loads(path.read_text(encoding="utf-8"))
         return [VulnerabilitySpec.model_validate(item) for item in raw]
+
+
+def _extract_enclosing_function_name(source: str, vuln_line: int) -> str | None:
+    """Return the name of the C function enclosing *vuln_line* using tree-sitter.
+
+    Args:
+        source: Full source text of the C file.
+        vuln_line: 1-based line number of the vulnerability.
+
+    Returns:
+        Function name string, or ``None`` if not determinable.
+    """
+    try:
+        parser = Parser(Language(tsc.language()))
+        tree = parser.parse(source.encode("utf-8", errors="replace"))
+    except Exception:
+        return None
+
+    def _find_func(node) -> object | None:
+        if node.type == "function_definition":
+            if node.start_point[0] <= vuln_line - 1 <= node.end_point[0]:
+                # function_definition → declarator → ... → identifier
+                for child in node.children:
+                    if child.type in ("function_declarator", "pointer_declarator"):
+                        for gc in child.children:
+                            if gc.type == "function_declarator":
+                                for ggc in gc.children:
+                                    if ggc.type == "identifier":
+                                        return source[ggc.start_byte:ggc.end_byte]
+                            if gc.type == "identifier":
+                                return source[gc.start_byte:gc.end_byte]
+                    if child.type == "identifier":
+                        return source[child.start_byte:child.end_byte]
+        for child in node.children:
+            result = _find_func(child)
+            if result is not None:
+                return result
+        return None
+
+    result = _find_func(tree.root_node)
+    return str(result) if result else None
