@@ -1,0 +1,28 @@
+{
+  "rule_id": "cpp/cwe-416/use-after-free",
+  "cwe": "CWE-416",
+  "file": "/home/cks/Project/SE-LLM-project/tests/e2e_workspace/cwe_416/target.c",
+  "line": 12,
+  "col": 12,
+  "message": "Use-after-free: p->value is accessed after free(p) on the trigger != 0 path",
+  "snippet": "return p->value;       /* ← ℓ  use-after-free when trigger != 0 */",
+  "trace": [],
+  "suspect_calls": [
+    "free",
+    "malloc"
+  ],
+  "pointer_vars": [],
+  "length_vars": [],
+  "bounds_hints": [
+    "include <stdlib",
+    "include <string",
+    "h>\n\ntypedef",
+    "trigger != 0"
+  ],
+  "build_context": {
+    "include_paths": [],
+    "defines": []
+  },
+  "entrypoint": "vulnerable",
+  "assertion_template": "no use of p after free(p)"
+}

@@ -1,0 +1,32 @@
+{
+  "id": "E2E-CWE-122",
+  "cwe": "CWE-122",
+  "description": "Heap-based buffer overflow via unchecked memcpy size",
+  "target": {
+    "file": "target.c",
+    "func": "vulnerable",
+    "line": 6
+  },
+  "phase1": {
+    "must_detect": true,
+    "expected_rule_id": "local/cpp/cwe-120-overflow",
+    "expected_assertion_template": "n <= min(len(dst), len(src))",
+    "min_findings": 1
+  },
+  "phase2": {
+    "expected_outcome": "bug_triggered",
+    "max_turns": 20,
+    "witness_symbolic_vars": ["src_size"],
+    "witness_must_violate": "src_size > 16"
+  },
+  "phase3": {
+    "expected_verdict": "CONFIRMED",
+    "expected_asan_type": "heap-buffer-overflow",
+    "crash_must_be_in_file": "target.c"
+  },
+  "performance": {
+    "max_wall_seconds": 120,
+    "max_llm_tokens": 50000,
+    "max_klee_paths": 500
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "id": "E2E-CWE-416",
+  "cwe": "CWE-416",
+  "description": "Use-after-free: p->value accessed after free(p)",
+  "target": {
+    "file": "target.c",
+    "func": "vulnerable",
+    "line": 12
+  },
+  "phase1": {
+    "must_detect": true,
+    "expected_rule_id": "cpp/cwe-416",
+    "expected_assertion_template": "no use of p after free(p)",
+    "min_findings": 1
+  },
+  "phase2": {
+    "expected_outcome": "bug_triggered",
+    "max_turns": 20,
+    "witness_symbolic_vars": ["trigger"],
+    "witness_must_violate": "trigger != 0"
+  },
+  "phase3": {
+    "expected_verdict": "CONFIRMED",
+    "expected_asan_type": "heap-use-after-free",
+    "crash_must_be_in_file": "target.c"
+  },
+  "performance": {
+    "max_wall_seconds": 120,
+    "max_llm_tokens": 50000,
+    "max_klee_paths": 500
+  }
+}

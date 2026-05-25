@@ -1,453 +1,399 @@
-"""
-End-to-End Self-Validation Test
-=================================
-Generates two deliberately vulnerable C programs, builds SARIF files that
-simulate CodeQL output, runs the full HAST pipeline through LangGraph, and
-asserts all four success criteria:
+"""E2E tests for the Sailor vulnerability discovery pipeline.
 
-  1. The AI generates a harness from the SARIF warning (no manual intervention).
-  2. Phase 2 (KLEE) produces a concrete PoC binary.
-  3. Phase 3 injects that PoC into a separately compiled ASan binary.
-  4. AddressSanitizer emits a verified crash dump.
+Markers
+-------
+e2e_phase1  Phase 1 only — uses pre-built SARIF fixtures, no Docker required.
+e2e_phase2  Phase 2 only — requires Docker + (real LLM or E2E_MOCK_LLM=true).
+e2e_phase3  Phase 3 only — requires Docker + fixtures/phase2_result.json.
+e2e_full    Full Phase 1 → 2 → 3 pipeline — requires Docker + real LLM.
 
-Vulnerability catalog
----------------------
-  CASE 1 — Stack-based buffer overflow (CWE-121)
-    `stack_overflow.c` / `stack_overflow()`
-    Copies a 64-byte symbolic input into a 16-byte stack buffer via `memcpy`.
-    The overflow is unconditional and size-fixed, making it trivially reachable
-    by KLEE without path explosion.
-
-  CASE 2 — Heap buffer overflow (CWE-122)
-    `heap_overflow.c` / `heap_write()`
-    Allocates 8 bytes and writes 32 bytes into the allocation.
-    KLEE can immediately detect the out-of-bounds write.
-
-Each case is run as an independent pipeline invocation with its own thread_id
-and evaluated against the strict success criteria.
-
-Usage
------
-  python3 -m pytest tests/e2e_self_test.py -v
-  # or directly:
-  python3 tests/e2e_self_test.py
+Run examples
+------------
+pytest tests/e2e_self_test.py -m e2e_phase1 -v
+E2E_MOCK_LLM=true pytest tests/e2e_self_test.py -m e2e_phase2 -v
+pytest tests/e2e_self_test.py -m e2e_phase3 -v
+pytest tests/e2e_self_test.py -m e2e_full -k cwe_122 -v
 """
 
 from __future__ import annotations
 
+import datetime
 import json
-import os
-import subprocess
-import sys
-import textwrap
-import traceback
-import uuid
-from dataclasses import dataclass, field
+import shutil
+import time
+import warnings
 from pathlib import Path
-from typing import Optional
 
-PROJECT_ROOT = Path(__file__).parent.parent.resolve()
-TEST_DIR = PROJECT_ROOT / "tests" / "e2e_workspace"
+import pytest
 
-# Add project root so imports work when run directly
-sys.path.insert(0, str(PROJECT_ROOT))
-
-from core.workflow import pipeline_app
-from langchain_core.runnables import RunnableConfig
-
-
-# ===========================================================================
-# Vulnerable target definitions
-# ===========================================================================
-
-@dataclass
-class VulnCase:
-    name: str
-    filename: str
-    source_code: str
-    cwe_id: str
-    vuln_line: int        # 1-indexed line number of the vulnerable statement
-    description: str
+from sailor.models.schemas import (
+    Phase1Result,
+    Phase2Result,
+    SEOutcome,
+    ValidationVerdict,
+    VulnerabilitySpec,
+)
+from sailor.phase1.fact_enrichment import FactEnricher
+from sailor.phase1.fact_generation import _parse_sarif
+from sailor.phase1.spec_generation import SpecificationGenerator
+from sailor.phase2.llm_orchestrator import Phase2Config
+from sailor.phase2.mock_llm_client import resolve_llm_client
+from sailor.phase2.pipeline import Phase2Pipeline
+from sailor.phase3.pipeline import Phase3Config, Phase3Pipeline
 
 
-VULN_CASES = [
-    VulnCase(
-        name="Stack Buffer Overflow",
-        filename="stack_overflow.c",
-        cwe_id="CWE-121",
-        vuln_line=12,
-        description="memcpy with fixed 64-byte source into 16-byte stack buffer",
-        source_code=textwrap.dedent("""\
-            #include <stdio.h>
-            #include <string.h>
-            #include <stdlib.h>
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-            /*
-             * DELIBERATE VULNERABILITY: stack-based buffer overflow.
-             * `buf` is 16 bytes; we copy INPUT_SIZE bytes unconditionally.
-             */
-            #define INPUT_SIZE 64
-
-            void stack_overflow(const char *input) {
-                char buf[16];
-                memcpy(buf, input, INPUT_SIZE);   /* line 12 — overflow */
-            }
-
-            #ifndef HARNESS
-            int main(void) {
-                char input[INPUT_SIZE];
-                /* read exactly INPUT_SIZE bytes from stdin for reproducibility */
-                size_t n = 0;
-                while (n < INPUT_SIZE) {
-                    int c = getchar();
-                    if (c == EOF) break;
-                    input[n++] = (char)c;
-                }
-                stack_overflow(input);
-                return 0;
-            }
-            #endif
-        """),
-    ),
-    VulnCase(
-        name="Heap Buffer Overflow",
-        filename="heap_overflow.c",
-        cwe_id="CWE-122",
-        vuln_line=13,
-        description="memcpy 32 bytes into an 8-byte heap allocation",
-        source_code=textwrap.dedent("""\
-            #include <stdio.h>
-            #include <string.h>
-            #include <stdlib.h>
-
-            /*
-             * DELIBERATE VULNERABILITY: heap buffer overflow.
-             * Only 8 bytes are allocated; 32 bytes are written.
-             */
-            #define WRITE_SIZE 32
-
-            void heap_write(const char *input) {
-                char *heap_buf = (char *)malloc(8);
-                if (!heap_buf) return;
-                memcpy(heap_buf, input, WRITE_SIZE);  /* line 13 — overflow */
-                free(heap_buf);
-            }
-
-            #ifndef HARNESS
-            int main(void) {
-                char input[WRITE_SIZE];
-                size_t n = 0;
-                while (n < WRITE_SIZE) {
-                    int c = getchar();
-                    if (c == EOF) break;
-                    input[n++] = (char)c;
-                }
-                heap_write(input);
-                return 0;
-            }
-            #endif
-        """),
-    ),
-]
-
-
-# ===========================================================================
-# Test harness setup
-# ===========================================================================
-
-def _write_source(case: VulnCase, out_dir: Path) -> Path:
-    src = out_dir / case.filename
-    src.write_text(case.source_code)
-    return src
-
-
-def _make_sarif(case: VulnCase, src_path: Path, source_dir: Path) -> Path:
-    rel = src_path.relative_to(source_dir)
-    sarif = {
-        "version": "2.1.0",
-        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
-        "runs": [{
-            "tool": {"driver": {"name": "CodeQL", "version": "2.17.0", "rules": []}},
-            "results": [{
-                "ruleId": case.cwe_id,
-                "message": {"text": case.description},
-                "locations": [{
-                    "physicalLocation": {
-                        "artifactLocation": {"uri": str(rel)},
-                        "region": {
-                            "startLine": case.vuln_line,
-                            "endLine":   case.vuln_line,
-                        },
-                    }
-                }],
-            }],
-        }],
-    }
-    sarif_path = source_dir / f"{case.filename}.sarif"
-    sarif_path.write_text(json.dumps(sarif, indent=2))
-    return sarif_path
-
-
-def _compile_asan(src_path: Path) -> Path:
-    """Compile with ASan + debug info. Returns binary path."""
-    import shutil
-    out = src_path.with_suffix(".asan")
-    res = None
-    for cc in (["clang"], ["gcc"]):
-        if not shutil.which(cc[0]):
-            continue
-        res = subprocess.run(
-            [*cc, "-fsanitize=address", "-g", "-O0",
-             "-fno-omit-frame-pointer",
-             str(src_path), "-o", str(out)],
-            capture_output=True, text=True,
+def load_fixture(workspace: Path, name: str) -> Path:
+    """Return the path to a fixture file, skipping the test if it is missing."""
+    path = workspace / "fixtures" / name
+    if not path.exists():
+        pytest.skip(
+            f"fixture not found: {path} — run tests/generate_fixtures.py first"
         )
-        if res.returncode == 0:
-            print(f"    ASan binary → {out.name} (via {cc[0]})")
-            return out
-    raise RuntimeError(
-        f"Cannot compile ASan binary for {src_path.name}:\n"
-        f"{res.stderr if res else 'no compiler found'}"
+    return path
+
+
+def _phase1_from_sarif(ws: Path, src_copy: Path, out: Path) -> Phase1Result:
+    """Run Phase 1 Stages 2+3 on the pre-built SARIF fixture.
+
+    *src_copy* must be a copy of *ws* placed in a path that does NOT contain
+    ``/tests/`` so that :data:`FILE_SKIP_PATTERNS` does not filter it out.
+    """
+    fixture_sarif = ws / "fixtures" / "findings.sarif"
+    if not fixture_sarif.exists():
+        pytest.skip(f"findings.sarif fixture not found: {fixture_sarif}")
+
+    sarif_dict = json.loads(fixture_sarif.read_text(encoding="utf-8"))
+    findings = _parse_sarif(sarif_dict, src_copy)
+
+    enricher = FactEnricher(project_root=src_copy, output_dir=out)
+    packs = enricher.run(findings)
+
+    spec_gen = SpecificationGenerator(output_dir=out)
+    specs = spec_gen.run(packs)
+
+    return Phase1Result.build(
+        project=f"e2e-{ws.name}",
+        project_root=str(src_copy),
+        total_findings=len(findings),
+        specifications=specs,
+        timestamp=datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
     )
 
 
-def _compile_plain(src_path: Path) -> Path:
-    """Compile a plain (non-ASan) binary for angr / sanity checks."""
-    out = src_path.with_suffix("")
-    res = subprocess.run(
-        ["gcc", "-g", "-O0", str(src_path), "-o", str(out)],
-        capture_output=True, text=True,
-    )
-    if res.returncode != 0:
-        raise RuntimeError(f"Plain compile failed:\n{res.stderr}")
-    return out
+def _normalize_spec(spec: VulnerabilitySpec, ws: Path, filename: str) -> VulnerabilitySpec:
+    """Return *spec* with spec.file replaced by a stable workspace path.
+
+    The stable path ``ws / filename`` is consistent across pytest runs so that
+    Phase 2 prompt hashes remain identical between record and playback.
+    """
+    spec_dict = json.loads(spec.model_dump_json())
+    spec_dict["file"] = str(ws / filename)
+    return VulnerabilitySpec.model_validate(spec_dict)
 
 
-# ===========================================================================
-# Pipeline runner
-# ===========================================================================
-
-MAX_HITL_LOOPS = 8   # safety cap against infinite HITL cycling
-
-@dataclass
-class RunResult:
-    case_name: str
-    thread_id: str
-    passed: bool = False
-    failure_reason: str = ""
-    hitl_loops: int = 0
-    poc_path: Optional[str] = None
-    rca_summary: Optional[str] = None
-    results: list = field(default_factory=list)
-
-
-def run_case(case: VulnCase, source_dir: Path, sarif_path: Path, asan_binary: Path) -> RunResult:
-    thread_id = f"e2e_{case.cwe_id.lower()}_{uuid.uuid4().hex[:6]}"
-    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
-    result = RunResult(case_name=case.name, thread_id=thread_id)
-
-    inputs = {
-        # ── Launch inputs ────────────────────────────────────────────────
-        "sarif_path":   str(sarif_path),
-        "source_dir":   str(source_dir),
-        "target_binary": str(asan_binary),   # used by angr; KLEE ignores it
-        "asan_binary":  str(asan_binary),    # pre-compiled ASan binary for Phase 3
-        "engine":       "klee",
-        "klee_whitebox": False,              # white-box mode OFF → avoids uClibc timeout
-        "max_retries":  3,
-        # ── Multi-finding state ──────────────────────────────────────────
-        "findings":      None,
-        "current_index": 0,
-        "results":       [],
-        # ── Per-finding working state ────────────────────────────────────
-        "metadata":     None,
-        "harness_code": None,
-        "poc_path":     None,
-        "rca_report":   None,
-        "retry_count":  0,
-        "skip_reason":  None,
-        "status":       "started",
-        "error_msg":    None,
-    }
-
-    print(f"  Streaming pipeline (thread={thread_id})...")
-    for update in pipeline_app.stream(inputs, config=config, stream_mode="updates"):
-        node = list(update.keys())[0]
-        print(f"    → {node}")
-
-    # ── HITL auto-resume loop ────────────────────────────────────────────
-    while result.hitl_loops < MAX_HITL_LOOPS:
-        state = pipeline_app.get_state(config)
-        if not state.next:
-            break
-        if state.next[0] != "run_symbex":
-            break
-
-        result.hitl_loops += 1
-        err = state.values.get("error_msg")
-        print(f"  ⏸  HITL pause #{result.hitl_loops}  (error: {err[:80] if err else 'none'})")
-
-        # Auto-resume without editing (LLM already corrected the harness if needed)
-        for update in pipeline_app.stream(None, config=config, stream_mode="updates"):
-            node = list(update.keys())[0]
-            print(f"    → {node}")
-
-    # ── Final state evaluation ───────────────────────────────────────────
-    state = pipeline_app.get_state(config)
-    vals  = state.values
-    result.results = vals.get("results") or []
-
-    # Look for a verified finding in the accumulated results list
-    verified_entry = next((r for r in result.results if r.get("status") == "verified"), None)
-
-    if verified_entry:
-        result.passed      = True
-        result.poc_path    = verified_entry.get("poc_path")
-        result.rca_summary = verified_entry.get("rca_summary")
-    else:
-        # Collect diagnostics
-        not_triggered = [r for r in result.results if r.get("status") == "not_triggered"]
-        skipped       = [r for r in result.results if r.get("status") == "skipped"]
-
-        if not result.results:
-            result.failure_reason = (
-                f"Pipeline status={vals.get('status')!r}  "
-                f"error={vals.get('error_msg')!r}"
-            )
-        elif not_triggered:
-            result.failure_reason = (
-                f"ASan did not crash: {not_triggered[0].get('reason','')}"
-            )
-        elif skipped:
-            result.failure_reason = (
-                f"Skipped by engine: {skipped[0].get('reason','')}"
-            )
-        else:
-            result.failure_reason = f"status={result.results[-1].get('status')}"
-
-    return result
-
-
-# ===========================================================================
+# ---------------------------------------------------------------------------
 # Assertion helpers
-# ===========================================================================
+# ---------------------------------------------------------------------------
 
-def _assert_criterion(label: str, ok: bool, detail: str = ""):
-    icon = "✓" if ok else "✗"
-    print(f"    {icon}  Criterion: {label}")
-    if not ok and detail:
-        print(f"         Detail : {detail}")
-    return ok
+def assert_phase1(result: Phase1Result, expected: dict, ws: Path) -> None:
+    """Assert Phase 1 output matches the expected.json phase1 section."""
+    p1 = expected["phase1"]
+    tgt = expected["target"]
 
-
-# ===========================================================================
-# Main
-# ===========================================================================
-
-def main():
-    print("=" * 70)
-    print(" Antigravity HAST — End-to-End Self-Validation Test")
-    print("=" * 70)
-
-    TEST_DIR.mkdir(parents=True, exist_ok=True)
-
-    overall_pass = True
-    case_results: list[RunResult] = []
-
-    for case in VULN_CASES:
-        print(f"\n{'─'*60}")
-        print(f" Case: {case.name}  ({case.cwe_id})")
-        print(f"{'─'*60}")
-
-        # ── Set up workspace ─────────────────────────────────────────────
-        case_dir = TEST_DIR / case.cwe_id.lower().replace("-", "_")
-        case_dir.mkdir(exist_ok=True)
-
-        try:
-            src_path   = _write_source(case, case_dir)
-            sarif_path = _make_sarif(case, src_path, case_dir)
-            asan_bin   = _compile_asan(src_path)
-            _compile_plain(src_path)  # just to verify it builds at all
-        except RuntimeError as e:
-            print(f"  SETUP FAILED: {e}")
-            overall_pass = False
-            continue
-
-        print(f"  Source  : {src_path.name}")
-        print(f"  SARIF   : {sarif_path.name}")
-        print(f"  ASan bin: {asan_bin.name}")
-
-        # ── Run pipeline ─────────────────────────────────────────────────
-        try:
-            r = run_case(case, case_dir, sarif_path, asan_bin)
-        except Exception as e:
-            print(f"  PIPELINE EXCEPTION: {e}")
-            traceback.print_exc()
-            overall_pass = False
-            continue
-
-        case_results.append(r)
-
-        # ── Evaluate four strict criteria ─────────────────────────────────
-        print(f"\n  Results ({len(r.results)} finding(s) processed):")
-        all_ok = True
-
-        # Criterion 1: AI generated a harness (pipeline reached Phase 2 at least once)
-        reached_symbex = r.hitl_loops > 0 or any(
-            res.get("status") in ("verified", "not_triggered", "skipped")
-            for res in r.results
+    if p1["must_detect"]:
+        matching = [
+            s for s in result.specifications
+            if tgt["file"] in s.file and tgt["func"] in s.entrypoint
+        ]
+        assert matching, (
+            f"Phase 1 did not detect {tgt['func']!r} in {tgt['file']!r}.\n"
+            f"Specs found: {[(s.file, s.entrypoint) for s in result.specifications]}"
         )
-        all_ok &= _assert_criterion(
-            "AI generated harness from SARIF",
-            reached_symbex,
-            "No HITL pause reached — harness generation may have failed",
+        spec = matching[0]
+        assert p1["expected_rule_id"] in spec.rule_id, (
+            f"Expected rule_id containing {p1['expected_rule_id']!r}, "
+            f"got {spec.rule_id!r}"
+        )
+        assert spec.assertion_template == p1["expected_assertion_template"], (
+            f"Expected template {p1['expected_assertion_template']!r}, "
+            f"got {spec.assertion_template!r}"
+        )
+    assert len(result.specifications) >= p1["min_findings"], (
+        f"Expected >= {p1['min_findings']} findings, "
+        f"got {len(result.specifications)}"
+    )
+
+
+def assert_phase2(results: list[Phase2Result], expected: dict) -> None:
+    """Assert Phase 2 output matches the expected.json phase2 section."""
+    p2 = expected["phase2"]
+    triggered = [r for r in results if r.outcome == SEOutcome.BUG_TRIGGERED]
+    assert triggered, (
+        f"Phase 2 did not trigger a bug. "
+        f"Outcomes: {[r.outcome.value for r in results]}"
+    )
+    r = triggered[0]
+    assert r.turns_used <= p2["max_turns"], (
+        f"Phase 2 used {r.turns_used} turns, max allowed {p2['max_turns']}"
+    )
+    if r.witness:
+        assert r.witness.ktest_paths, "BUG_TRIGGERED witness has no .ktest files"
+
+
+def assert_phase3(p3_result, expected: dict) -> None:
+    """Assert Phase 3 output matches the expected.json phase3 section."""
+    p3 = expected["phase3"]
+    confirmed = [
+        r for r in p3_result.results
+        if r.verdict == ValidationVerdict.CONFIRMED
+    ]
+    assert confirmed, (
+        f"Phase 3 did not confirm the bug. "
+        f"Verdicts: {[r.verdict.value for r in p3_result.results]}"
+    )
+    r = confirmed[0]
+    assert r.asan_type == p3["expected_asan_type"], (
+        f"Expected ASan type {p3['expected_asan_type']!r}, got {r.asan_type!r}"
+    )
+    assert p3["crash_must_be_in_file"] in r.file, (
+        f"Crash in {r.file!r}, expected path containing "
+        f"{p3['crash_must_be_in_file']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 only (no Docker required)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.e2e_phase1
+def test_phase1_detects_vulnerability(
+    workspace: tuple[Path, dict],
+    tmp_path: Path,
+) -> None:
+    """Phase 1 must detect the vulnerability defined in expected.json.
+
+    Uses pre-built SARIF fixtures — no CodeQL or Docker required.
+    Writes fixtures/spec.json for downstream Phase 2/3 tests.
+    """
+    ws, expected = workspace
+    tgt = expected["target"]
+
+    # Copy workspace to tmp_path so the absolute path avoids /tests/ filtering
+    src_copy = tmp_path / "src"
+    shutil.copytree(ws, src_copy)
+
+    result = _phase1_from_sarif(ws, src_copy, tmp_path / "phase1")
+    assert_phase1(result, expected, ws)
+
+    # Save normalized spec.json with a stable file path (independent of tmp_path)
+    fixture_dir = ws / "fixtures"
+    fixture_dir.mkdir(exist_ok=True)
+
+    matching = [
+        s for s in result.specifications if tgt["func"] in s.entrypoint
+    ]
+    if matching:
+        spec_norm = _normalize_spec(matching[0], ws, tgt["file"])
+        (fixture_dir / "spec.json").write_text(
+            spec_norm.model_dump_json(indent=2), encoding="utf-8"
         )
 
-        # Criterion 2: Phase 2 produced a PoC (poc_path set)
-        has_poc = bool(r.poc_path)
-        all_ok &= _assert_criterion(
-            "Phase 2 produced a concrete PoC input",
-            has_poc,
-            "poc_path is empty — KLEE may have returned UNSAT or timed out",
-        )
 
-        # Criterion 3: Phase 3 ran (results list non-empty)
-        ran_phase3 = bool(r.results)
-        all_ok &= _assert_criterion(
-            "Phase 3 (ASan injection) executed",
-            ran_phase3,
-            "results list is empty — pipeline may have failed before verify node",
-        )
+# ---------------------------------------------------------------------------
+# Phase 2 only
+# ---------------------------------------------------------------------------
 
-        # Criterion 4: ASan crash confirmed
-        all_ok &= _assert_criterion(
-            "ASan crash dump confirmed (exploitability proved)",
-            r.passed,
-            r.failure_reason,
-        )
+@pytest.mark.e2e_phase2
+def test_phase2_triggers_bug(
+    workspace: tuple[Path, dict],
+    docker_runner,
+    tmp_path: Path,
+) -> None:
+    """Phase 2 must trigger a bug within max_turns.
 
-        if all_ok:
-            print(f"\n  ✅  PASS  — {case.name}")
-            print(f"     RCA : {r.rca_summary}")
-            print(f"     PoC : {r.poc_path}")
+    Loads fixtures/spec.json; skips if the fixture is missing.
+    Uses real Anthropic API by default; MockLLMClient when E2E_MOCK_LLM=true.
+    Writes fixtures/phase2_result.json and fixtures/witness.ktest.
+    """
+    ws, expected = workspace
+    spec_path = load_fixture(ws, "spec.json")
+    spec = VulnerabilitySpec.model_validate_json(spec_path.read_text(encoding="utf-8"))
+
+    config = Phase2Config(
+        project_name=f"e2e-{ws.name}",
+        project_root=ws,
+        output_dir=tmp_path / "phase2",
+        docker_runner=docker_runner,
+        T_max=expected["phase2"]["max_turns"],
+        llm_client=resolve_llm_client(ws / "fixtures"),
+    )
+    results = Phase2Pipeline(config).run([spec])
+
+    assert_phase2(results, expected)
+
+    # Save fixtures for Phase 3
+    fixture_dir = ws / "fixtures"
+    fixture_dir.mkdir(exist_ok=True)
+    triggered = next(
+        (r for r in results if r.outcome == SEOutcome.BUG_TRIGGERED), None
+    )
+    if triggered:
+        if triggered.witness and triggered.witness.ktest_paths:
+            stable_ktest = fixture_dir / "witness.ktest"
+            shutil.copy(triggered.witness.ktest_paths[0], stable_ktest)
+
+            # Rewrite ktest_paths to the stable fixture path so Phase 3
+            # can load phase2_result.json without relying on the /tmp/ dir.
+            result_dict = json.loads(triggered.model_dump_json())
+            result_dict["witness"]["ktest_paths"] = [str(stable_ktest)]
+            (fixture_dir / "phase2_result.json").write_text(
+                json.dumps(result_dict, indent=2), encoding="utf-8"
+            )
         else:
-            print(f"\n  ❌  FAIL  — {case.name}")
-            overall_pass = False
-
-    # ── Final summary ────────────────────────────────────────────────────
-    print(f"\n{'=' * 70}")
-    passed = sum(1 for r in case_results if r.passed)
-    total  = len(VULN_CASES)
-    print(f" SUMMARY: {passed} / {total} cases passed")
-    for r in case_results:
-        icon = "✅" if r.passed else "❌"
-        print(f"  {icon}  {r.case_name:40s}  loops={r.hitl_loops}")
-    print("=" * 70)
-
-    if not overall_pass:
-        sys.exit(1)
-    print("\n🎉  All self-validation criteria satisfied.\n")
+            (fixture_dir / "phase2_result.json").write_text(
+                triggered.model_dump_json(indent=2), encoding="utf-8"
+            )
 
 
-if __name__ == "__main__":
-    main()
+# ---------------------------------------------------------------------------
+# Phase 3 only
+# ---------------------------------------------------------------------------
+
+@pytest.mark.e2e_phase3
+def test_phase3_confirms_vulnerability(
+    workspace: tuple[Path, dict],
+    docker_runner,
+    tmp_path: Path,
+) -> None:
+    """Phase 3 must confirm the vulnerability with ASan.
+
+    Loads fixtures/spec.json and fixtures/phase2_result.json; skips if
+    either is missing.  No LLM calls.  Writes fixtures/verified_bug.json.
+    """
+    ws, expected = workspace
+    spec_path = load_fixture(ws, "spec.json")
+    p2_result_path = load_fixture(ws, "phase2_result.json")
+
+    spec = VulnerabilitySpec.model_validate_json(spec_path.read_text(encoding="utf-8"))
+    p2_result = Phase2Result.model_validate_json(
+        p2_result_path.read_text(encoding="utf-8")
+    )
+
+    runner = docker_runner
+
+    # Copy source into the container so the ASan build can find it
+    runner.setup_target(
+        project_url=None,
+        commit=None,
+        build_commands=[],
+        dependencies=["make"],
+        local_source_path=str(ws),
+    )
+    container_src = f"/workspace/e2e-{ws.name}/src"
+
+    config = Phase3Config(
+        project_name=f"e2e-{ws.name}",
+        # Container-side path: ResultClassifier._is_project_source() uses it
+        project_root=Path(container_src),
+        output_dir=tmp_path / "phase3",
+        docker_runner=runner,
+        build_command="make all",
+    )
+    p3_result = Phase3Pipeline(config).run([p2_result], [spec])
+
+    assert_phase3(p3_result, expected)
+
+    fixture_dir = ws / "fixtures"
+    fixture_dir.mkdir(exist_ok=True)
+    confirmed = next(
+        (r for r in p3_result.results if r.verdict == ValidationVerdict.CONFIRMED),
+        None,
+    )
+    if confirmed:
+        (fixture_dir / "verified_bug.json").write_text(
+            json.dumps(json.loads(confirmed.model_dump_json()), indent=2),
+            encoding="utf-8",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Full pipeline
+# ---------------------------------------------------------------------------
+
+@pytest.mark.e2e_full
+def test_full_pipeline(
+    workspace: tuple[Path, dict],
+    docker_runner,
+    tmp_path: Path,
+) -> None:
+    """Full Phase 1 → 2 → 3 pipeline.
+
+    Runs the real Anthropic API by default.
+    Validates all three phases against expected.json.
+    A performance warning is emitted (not a failure) if over the time limit.
+    """
+    ws, expected = workspace
+    runner = docker_runner
+    start = time.perf_counter()
+    tgt = expected["target"]
+
+    # ── Phase 1 (pre-built SARIF, no Docker) ──────────────────────────────
+    src_copy = tmp_path / "src"
+    shutil.copytree(ws, src_copy)
+
+    p1_result = _phase1_from_sarif(ws, src_copy, tmp_path / "phase1")
+    assert_phase1(p1_result, expected, ws)
+
+    target_specs = [
+        s for s in p1_result.specifications if tgt["func"] in s.entrypoint
+    ]
+    assert target_specs, "Phase 1 found no spec for the target function"
+
+    normalized_specs = [_normalize_spec(s, ws, tgt["file"]) for s in target_specs]
+
+    # ── Phase 2 ────────────────────────────────────────────────────────────
+    p2_config = Phase2Config(
+        project_name=f"e2e-{ws.name}",
+        project_root=ws,
+        output_dir=tmp_path / "phase2",
+        docker_runner=runner,
+        T_max=expected["phase2"]["max_turns"],
+    )
+    p2_results = Phase2Pipeline(p2_config).run(normalized_specs)
+    assert_phase2(p2_results, expected)
+
+    # ── Phase 3 ────────────────────────────────────────────────────────────
+    triggered = [r for r in p2_results if r.outcome == SEOutcome.BUG_TRIGGERED]
+
+    runner.setup_target(
+        project_url=None,
+        commit=None,
+        build_commands=[],
+        dependencies=["make"],
+        local_source_path=str(ws),
+    )
+    container_src = f"/workspace/e2e-{ws.name}/src"
+
+    p3_config = Phase3Config(
+        project_name=f"e2e-{ws.name}",
+        project_root=Path(container_src),
+        output_dir=tmp_path / "phase3",
+        docker_runner=runner,
+        build_command="make all",
+    )
+    p3_result = Phase3Pipeline(p3_config).run(triggered, normalized_specs)
+    assert_phase3(p3_result, expected)
+
+    elapsed = time.perf_counter() - start
+    perf = expected["performance"]
+    if elapsed > perf["max_wall_seconds"]:
+        warnings.warn(
+            f"Performance: {elapsed:.1f}s > limit {perf['max_wall_seconds']}s "
+            f"for {ws.name}",
+            UserWarning,
+            stacklevel=2,
+        )

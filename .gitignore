@@ -6,6 +6,9 @@ __pycache__/
 venv/
 env/
 
+# pytest
+.pytest_cache/
+
 # C / Build artifacts
 *.o
 *.obj
@@ -53,3 +56,14 @@ CodeQLSlicer.py
 klee_harness.c
 target.bc
 klee-out/
+
+eval_run.log
+output_dir_eval.log
+output_dir
+tcpdump_sast/
+dummy_project/
+workspace/
+tcpdump
+
+# Secrets
+.env

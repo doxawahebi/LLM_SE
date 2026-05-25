@@ -1,0 +1,29 @@
+{
+  "rule_id": "local/cpp/cwe-120-overflow",
+  "cwe": "CWE-120",
+  "file": "/home/cks/Project/SE-LLM-project/tests/e2e_workspace/cwe_122/target.c",
+  "line": 6,
+  "col": 5,
+  "message": "Heap-based buffer overflow: memcpy called with src_size not bounded by dst_size",
+  "snippet": "memcpy(dst, src, src_size);   /* ← ℓ */",
+  "trace": [],
+  "suspect_calls": [
+    "memcpy"
+  ],
+  "pointer_vars": [],
+  "length_vars": [
+    "dst_size",
+    "src_size"
+  ],
+  "bounds_hints": [
+    "include <stdlib",
+    "include <string",
+    "h>\n\nvoid"
+  ],
+  "build_context": {
+    "include_paths": [],
+    "defines": []
+  },
+  "entrypoint": "vulnerable",
+  "assertion_template": "n <= min(len(dst), len(src))"
+}

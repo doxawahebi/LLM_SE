@@ -1,0 +1,41 @@
+FROM klee/klee:latest
+
+USER root
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Remove Kitware repo with expired key (present in klee/klee base image)
+RUN rm -f /etc/apt/sources.list.d/archive_uri-https_apt_kitware_com_ubuntu_-jammy.list \
+          /etc/apt/trusted.gpg.d/kitware*.gpg 2>/dev/null || true
+
+# ── System tools ─────────────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential git curl wget ca-certificates \
+    autoconf automake libtool pkg-config bear \
+    python3 python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── LLVM / Clang 14 (for harness compilation — matches KLEE bitcode ABI) ────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    clang-14 llvm-14 llvm-14-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN update-alternatives --install /usr/bin/clang      clang      /usr/bin/clang-14      100 \
+ && update-alternatives --install /usr/bin/clang++    clang++    /usr/bin/clang++-14    100 \
+ && update-alternatives --install /usr/bin/llvm-link  llvm-link  /usr/bin/llvm-link-14  100 \
+ && update-alternatives --install /usr/bin/llvm-dis   llvm-dis   /usr/bin/llvm-dis-14   100
+
+# ── CodeQL CLI ───────────────────────────────────────────────────────────────
+ARG CODEQL_VERSION=2.16.5
+RUN wget -q \
+    "https://github.com/github/codeql-action/releases/download/codeql-bundle-v${CODEQL_VERSION}/codeql-bundle-linux64.tar.gz" \
+    -O /tmp/codeql.tar.gz \
+    && tar -xzf /tmp/codeql.tar.gz -C /usr/local/ \
+    && rm /tmp/codeql.tar.gz
+ENV PATH="/usr/local/codeql:${PATH}"
+
+# ── Sailor CodeQL query directory (mounted at runtime) ───────────────────────
+# Queries are bind-mounted via docker-compose:
+#   -v ./sailor/codeql/queries:/sailor-queries:ro
+RUN mkdir -p /sailor-queries
+
+WORKDIR /workspace

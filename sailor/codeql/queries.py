@@ -665,6 +665,13 @@ class CodeQLQuerySuite:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
+        # qlpack.yml declares the codeql/cpp-all dependency so `import cpp` resolves.
+        qlpack = output_dir / "qlpack.yml"
+        qlpack.write_text(
+            "name: sailor/custom-queries\nversion: 0.0.1\ndependencies:\n  codeql/cpp-all: \"*\"\n",
+            encoding="utf-8",
+        )
+
         paths: list[Path] = []
         for q in self.custom_queries:
             out = output_dir / f"{q.query_id.replace('/', '_')}.ql"

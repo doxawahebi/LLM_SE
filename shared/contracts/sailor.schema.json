@@ -1,0 +1,1235 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sailor.dev/schemas/sailor.schema.json",
+  "title": "Sailor API Contracts",
+  "description": "Single source of truth for all types shared between frontend and backend.\nGenerated artifacts (TypeScript, Pydantic) must NOT be hand-edited.\nSee shared/contracts/README.md for the conflict resolution log.",
+  "$defs": {
+
+    "RunStatus": {
+      "type": "string",
+      "enum": [
+        "created",
+        "needs_build_config",
+        "queued",
+        "running",
+        "paused",
+        "completed",
+        "failed",
+        "cancelled",
+        "archived"
+      ],
+      "description": "Run lifecycle states. See backend_spec.md §3.1.\nNOTE: 'archived' is the soft-delete terminal state from DELETE /api/runs/:id."
+    },
+
+    "Phase1Status": {
+      "type": "string",
+      "enum": ["emitted", "filtered_out"],
+      "description": "Phase 1 outcome per spec. See backend_spec.md §3.2."
+    },
+
+    "Phase2Status": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "exploring",
+        "authoring",
+        "refining",
+        "bug_triggered",
+        "inconclusive",
+        "likely_false_positive",
+        "errored"
+      ],
+      "description": "Phase 2 spec state machine. See backend_spec.md §3.2.\nNOTE: 'errored' is the terminal failure state — was missing from frontend types."
+    },
+
+    "Phase3Status": {
+      "type": "string",
+      "enum": [
+        "not_eligible",
+        "queued",
+        "running",
+        "confirmed",
+        "rejected",
+        "errored"
+      ],
+      "description": "Phase 3 spec state machine. See backend_spec.md §3.3.\nNOTE: 'skipped' (in old frontend types) was renamed to 'not_eligible' to match backend."
+    },
+
+    "VerdictValue": {
+      "type": "string",
+      "enum": ["confirmed", "rejected"],
+      "description": "Phase 3 verdict (lowercase, per backend §2.1).\nFrontend rendering may upper-case for display but wire format is lowercase."
+    },
+
+    "Phase2Outcome": {
+      "type": "string",
+      "enum": [
+        "bug_triggered",
+        "inconclusive",
+        "likely_false_positive",
+        "errored"
+      ],
+      "description": "Phase 2 terminal outcome. Distinct from Phase 3 Verdict."
+    },
+
+    "UserRole": {
+      "type": "string",
+      "enum": ["viewer", "operator", "intervener", "admin"],
+      "description": "User role, least to most privileged. See frontend_spec.md §10."
+    },
+
+    "TurnKind": {
+      "type": "string",
+      "enum": [
+        "explore",
+        "author",
+        "compile_fail",
+        "klee_run",
+        "refinement",
+        "intervention",
+        "terminal"
+      ],
+      "description": "Turn kind in Phase 2 loop. See backend_spec.md §2.1.\nNOTE: 'klee_timeout' (frontend) is NOT a turn kind — KLEE timeout is a klee_run outcome.\n'terminal' is the final marker turn at phase2_status terminal transition."
+    },
+
+    "CompileErrorClass": {
+      "type": "string",
+      "enum": [
+        "incomplete_type",
+        "conflicting_proto",
+        "redefinition",
+        "other"
+      ],
+      "description": "Classification of clang errors during Phase 2 compile_fail turns.\nProduced by the Phase 2 orchestrator (in worker), persisted on Turn payload."
+    },
+
+    "KleeOutcome": {
+      "type": "string",
+      "enum": ["not_reached", "site_reached", "bug_triggered"],
+      "description": "KLEE run outcome, parsed from KLEE stderr. See DockerRunner.run_klee()."
+    },
+
+    "RunCounters": {
+      "type": "object",
+      "description": "Denormalized counters per run, maintained by the backend.\nField names match backend_spec.md §2.1 verbatim.\nFrontend MUST use these names; legacy aliases like 'total_specs' are removed.",
+      "additionalProperties": false,
+      "required": [
+        "specs_total",
+        "specs_filtered_out",
+        "specs_emitted",
+        "specs_phase2_queued",
+        "specs_phase2_running",
+        "specs_phase2_bug_triggered",
+        "specs_phase2_inconclusive",
+        "specs_phase2_likely_fp",
+        "specs_phase2_errored",
+        "specs_phase3_queued",
+        "specs_phase3_confirmed",
+        "specs_phase3_rejected",
+        "specs_phase3_errored",
+        "unique_confirmed",
+        "total_llm_tokens",
+        "total_klee_seconds"
+      ],
+      "properties": {
+        "specs_total":               { "type": "integer", "minimum": 0 },
+        "specs_filtered_out":        { "type": "integer", "minimum": 0 },
+        "specs_emitted":             { "type": "integer", "minimum": 0 },
+        "specs_phase2_queued":       { "type": "integer", "minimum": 0 },
+        "specs_phase2_running":      { "type": "integer", "minimum": 0 },
+        "specs_phase2_bug_triggered":{ "type": "integer", "minimum": 0 },
+        "specs_phase2_inconclusive": { "type": "integer", "minimum": 0 },
+        "specs_phase2_likely_fp":    { "type": "integer", "minimum": 0 },
+        "specs_phase2_errored":      { "type": "integer", "minimum": 0 },
+        "specs_phase3_queued":       { "type": "integer", "minimum": 0 },
+        "specs_phase3_confirmed":    { "type": "integer", "minimum": 0 },
+        "specs_phase3_rejected":     { "type": "integer", "minimum": 0 },
+        "specs_phase3_errored":      { "type": "integer", "minimum": 0 },
+        "unique_confirmed":          { "type": "integer", "minimum": 0 },
+        "total_llm_tokens":          { "type": "integer", "minimum": 0 },
+        "total_klee_seconds":        { "type": "integer", "minimum": 0 }
+      }
+    },
+
+    "RunConfig": {
+      "type": "object",
+      "description": "Per-run configuration. See backend_spec.md §2.1 (RunConfig).\nField names use snake_case throughout; legacy uppercase aliases (T_explore etc.) are removed.\nKeys are flat: 'phase2_t_explore' rather than nested 'phase2.t_explore', because JSON object keys with dots are ambiguous when consumed by typed languages.",
+      "additionalProperties": false,
+      "required": [
+        "phase1_query_suite",
+        "phase1_skip_files",
+        "phase1_skip_functions",
+        "phase2_t_explore",
+        "phase2_t_author",
+        "phase2_t_max",
+        "phase2_t_klee_seconds",
+        "phase2_r_max",
+        "phase2_parallelism",
+        "phase2_llm_provider",
+        "phase2_llm_model",
+        "phase3_enabled"
+      ],
+      "properties": {
+        "phase1_query_suite": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Query ids enabled for Phase 1. Default: all 34."
+        },
+        "phase1_skip_files": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Regex patterns matching file paths to skip."
+        },
+        "phase1_skip_functions": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Regex patterns matching function names to skip."
+        },
+        "phase2_t_explore":      { "type": "integer", "minimum": 0, "default": 8 },
+        "phase2_t_author":       { "type": "integer", "minimum": 0, "default": 12 },
+        "phase2_t_max":          { "type": "integer", "minimum": 1, "default": 60 },
+        "phase2_t_klee_seconds": { "type": "integer", "minimum": 1, "default": 300 },
+        "phase2_r_max":          { "type": "integer", "minimum": 0, "default": 15 },
+        "phase2_parallelism":    { "type": "integer", "minimum": 1, "default": 128 },
+        "phase2_llm_provider":   { "type": "string" },
+        "phase2_llm_model":      { "type": "string" },
+        "phase3_enabled":        { "type": "boolean", "default": true },
+        "phase3_asan_options":   { "type": ["string", "null"] }
+      }
+    },
+
+    "Phase1Summary": {
+      "type": "object",
+      "description": "Phase 1 aggregate summary embedded in Run.",
+      "additionalProperties": false,
+      "required": ["raw_findings", "after_filter", "specs_emitted"],
+      "properties": {
+        "raw_findings":   { "type": "integer", "minimum": 0 },
+        "after_filter":   { "type": "integer", "minimum": 0 },
+        "specs_emitted":  { "type": "integer", "minimum": 0 }
+      }
+    },
+
+    "Run": {
+      "type": "object",
+      "description": "A single pipeline invocation. See backend_spec.md §2.1.",
+      "additionalProperties": false,
+      "required": [
+        "run_id",
+        "name",
+        "status",
+        "config",
+        "counters",
+        "created_at",
+        "created_by",
+        "build_command",
+        "codeql_build_mode"
+      ],
+      "properties": {
+        "run_id":            { "type": "string" },
+        "name":              { "type": "string" },
+        "project_zip_ref":   { "type": ["string", "null"] },
+        "build_command":     { "type": "string" },
+        "codeql_build_mode": {
+          "type": "string",
+          "enum": ["autodetect", "none", "custom"]
+        },
+        "config":   { "$ref": "#/$defs/RunConfig" },
+        "status":   { "$ref": "#/$defs/RunStatus" },
+        "counters": { "$ref": "#/$defs/RunCounters" },
+        "phase1_summary": {
+          "oneOf": [
+            { "$ref": "#/$defs/Phase1Summary" },
+            { "type": "null" }
+          ]
+        },
+        "created_at":    { "type": "string", "format": "date-time" },
+        "started_at":    { "type": ["string", "null"], "format": "date-time" },
+        "completed_at":  { "type": ["string", "null"], "format": "date-time" },
+        "created_by":    { "type": "string", "description": "user id" },
+        "error":         { "type": ["string", "null"] }
+      }
+    },
+
+    "Spec": {
+      "type": "object",
+      "description": "VulnerabilitySpec record. See backend_spec.md §2.1.\nField names match backend authoritatively.",
+      "additionalProperties": false,
+      "required": [
+        "spec_id",
+        "run_id",
+        "rule_id",
+        "file",
+        "line",
+        "message",
+        "phase1_status",
+        "created_at",
+        "last_event_at"
+      ],
+      "properties": {
+        "spec_id":            { "type": "string" },
+        "run_id":             { "type": "string" },
+        "rule_id":            { "type": "string" },
+        "cwe":                { "type": ["string", "null"], "description": "Derived from rule_id, e.g. 'CWE-122'" },
+        "file":               { "type": "string" },
+        "line":               { "type": "integer" },
+        "func":               { "type": ["string", "null"] },
+        "message":            { "type": "string" },
+        "snippet":            { "type": ["string", "null"] },
+        "entrypoint":         { "type": ["string", "null"] },
+        "assertion_template": { "type": ["string", "null"] },
+
+        "phase1_status": { "$ref": "#/$defs/Phase1Status" },
+        "phase2_status": {
+          "oneOf": [
+            { "$ref": "#/$defs/Phase2Status" },
+            { "type": "null" }
+          ]
+        },
+        "phase3_status": {
+          "oneOf": [
+            { "$ref": "#/$defs/Phase3Status" },
+            { "type": "null" }
+          ]
+        },
+
+        "current_turn":     { "type": ["integer", "null"], "minimum": 0 },
+        "turn_count_total": { "type": ["integer", "null"], "minimum": 0 },
+        "refine_count":     { "type": ["integer", "null"], "minimum": 0 },
+
+        "phase2_outcome": {
+          "oneOf": [
+            { "$ref": "#/$defs/Phase2Outcome" },
+            { "type": "null" }
+          ]
+        },
+        "phase2_error": { "type": ["string", "null"] },
+        "phase3_verdict": {
+          "oneOf": [
+            { "$ref": "#/$defs/VerdictValue" },
+            { "type": "null" }
+          ]
+        },
+        "phase3_error": { "type": ["string", "null"] },
+
+        "worker_id":            { "type": ["string", "null"] },
+        "intervention_pending": { "type": "boolean", "default": false },
+
+        "artifacts_root": { "type": ["string", "null"] },
+        "created_at":     { "type": "string", "format": "date-time" },
+        "last_event_at":  { "type": "string", "format": "date-time" },
+
+        "token_cost":  { "type": ["integer", "null"], "minimum": 0, "description": "Cumulative LLM tokens for this spec." }
+      }
+    },
+
+    "Turn": {
+      "type": "object",
+      "description": "One iteration of the Phase 2 loop. Append-only. See backend_spec.md §2.1.\nPayload is fetched separately via GET /turns/:turn_id — the list endpoint returns Turn rows WITHOUT payload (only payload_ref).",
+      "additionalProperties": false,
+      "required": [
+        "turn_id",
+        "spec_id",
+        "turn_number",
+        "kind",
+        "started_at",
+        "summary"
+      ],
+      "properties": {
+        "turn_id":         { "type": "string" },
+        "spec_id":         { "type": "string" },
+        "turn_number":     { "type": "integer", "minimum": 0 },
+        "kind":            { "$ref": "#/$defs/TurnKind" },
+        "started_at":      { "type": "string", "format": "date-time" },
+        "ended_at":        { "type": ["string", "null"], "format": "date-time" },
+        "duration_ms":     { "type": ["integer", "null"], "minimum": 0 },
+        "payload_ref":     { "type": ["string", "null"], "description": "Artifact store reference to detailed payload. Fetch via GET /turns/:turn_id." },
+        "summary":         { "type": "string", "description": "Short string for timeline card (no large blobs)." },
+        "tokens_consumed": { "type": ["integer", "null"], "minimum": 0 },
+        "klee_seconds":    { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+
+    "TurnDetail": {
+      "type": "object",
+      "description": "Full Turn including inlined payload. Returned by GET /turns/:turn_id.\nThe payload variant depends on kind.",
+      "additionalProperties": false,
+      "required": ["turn", "payload"],
+      "properties": {
+        "turn":    { "$ref": "#/$defs/Turn" },
+        "payload": { "$ref": "#/$defs/TurnPayload" }
+      }
+    },
+
+    "TurnPayload": {
+      "description": "Discriminated union of payload shapes. Discriminator: 'kind'.",
+      "oneOf": [
+        { "$ref": "#/$defs/LLMTurnPayload" },
+        { "$ref": "#/$defs/CompileFailPayload" },
+        { "$ref": "#/$defs/KleeRunPayload" },
+        { "$ref": "#/$defs/InterventionPayload" },
+        { "$ref": "#/$defs/TerminalPayload" }
+      ]
+    },
+
+    "LLMTurnPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "prompt_tokens", "completion_tokens", "response_summary"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["explore", "author", "refinement"]
+        },
+        "prompt_tokens":     { "type": "integer", "minimum": 0 },
+        "completion_tokens": { "type": "integer", "minimum": 0 },
+        "tool_calls": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["name"],
+            "properties": {
+              "name":      { "type": "string" },
+              "arguments": {}
+            }
+          }
+        },
+        "response_summary": { "type": "string" },
+        "prompt_excerpt":   { "type": ["string", "null"] },
+        "response_excerpt": { "type": ["string", "null"] }
+      }
+    },
+
+    "CompileFailPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "error_class", "raw_error"],
+      "properties": {
+        "kind":             { "type": "string", "const": "compile_fail" },
+        "error_class":      { "$ref": "#/$defs/CompileErrorClass" },
+        "raw_error":        { "type": "string" },
+        "suggested_fix":    { "type": ["string", "null"] },
+        "relevant_source":  { "type": ["string", "null"] }
+      }
+    },
+
+    "KleeRunPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "outcome", "paths_explored"],
+      "properties": {
+        "kind":              { "type": "string", "const": "klee_run" },
+        "outcome":           { "$ref": "#/$defs/KleeOutcome" },
+        "paths_explored":    { "type": "integer", "minimum": 0 },
+        "functions_entered": { "type": "array", "items": { "type": "string" } },
+        "functions_missed":  { "type": "array", "items": { "type": "string" } },
+        "ktest_paths":       { "type": "array", "items": { "type": "string" } },
+        "stderr_excerpt":    { "type": "string" },
+        "timed_out":         { "type": "boolean", "default": false, "description": "True if KLEE hit T_klee. Replaces the former 'klee_timeout' turn kind." }
+      }
+    },
+
+    "InterventionPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "intervention_type", "actor"],
+      "properties": {
+        "kind":              { "type": "string", "const": "intervention" },
+        "intervention_type": {
+          "type": "string",
+          "enum": ["edit_harness", "force_outcome", "edit_spec"]
+        },
+        "actor":             { "type": "string", "description": "user id" },
+        "summary":           { "type": ["string", "null"] }
+      }
+    },
+
+    "TerminalPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "final_outcome"],
+      "properties": {
+        "kind":          { "type": "string", "const": "terminal" },
+        "final_outcome": { "$ref": "#/$defs/Phase2Outcome" }
+      }
+    },
+
+    "Verdict": {
+      "type": "object",
+      "description": "Phase 3 verdict record. See backend_spec.md §2.1.",
+      "additionalProperties": false,
+      "required": [
+        "verdict_id",
+        "spec_id",
+        "verdict",
+        "cwe",
+        "asan_type",
+        "file",
+        "line",
+        "func",
+        "dedup_key"
+      ],
+      "properties": {
+        "verdict_id":         { "type": "string" },
+        "spec_id":            { "type": "string" },
+        "verdict":            { "$ref": "#/$defs/VerdictValue" },
+        "cwe":                { "type": "string" },
+        "asan_type":          { "type": "string", "description": "e.g. 'heap-buffer-overflow'" },
+        "file":               { "type": "string" },
+        "line":               { "type": "integer" },
+        "func":               { "type": "string" },
+        "inputs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "value"],
+            "properties": {
+              "name":  { "type": "string" },
+              "value": { "type": "string" }
+            }
+          }
+        },
+        "asan_report_ref":   { "type": ["string", "null"] },
+        "replay_driver_ref": { "type": ["string", "null"] },
+        "dedup_key":         { "type": "string" }
+      }
+    },
+
+    "InterventionRequest": {
+      "description": "POST /api/runs/:run_id/specs/:spec_id/intervene body. Discriminator: 'type'.\nSee backend_spec.md §6.",
+      "oneOf": [
+        { "$ref": "#/$defs/EditHarnessRequest" },
+        { "$ref": "#/$defs/ForceOutcomeRequest" },
+        { "$ref": "#/$defs/EditSpecRequest" }
+      ]
+    },
+
+    "EditHarnessRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "artifact", "contents", "base_version"],
+      "properties": {
+        "type": { "type": "string", "const": "edit_harness" },
+        "artifact": {
+          "type": "string",
+          "enum": ["driver", "slice", "assertions"],
+          "description": "Logical artifact name, without '.c' extension. Frontend display may add '.c'."
+        },
+        "contents":     { "type": "string", "description": "UTF-8 file contents." },
+        "base_version": { "type": "integer", "minimum": 0, "description": "Optimistic concurrency: the version the user was editing. 409 on conflict." }
+      }
+    },
+
+    "ForceOutcomeRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "outcome"],
+      "properties": {
+        "type": { "type": "string", "const": "force_outcome" },
+        "outcome": {
+          "type": "string",
+          "enum": ["skip_to_phase3", "mark_inconclusive", "mark_likely_fp"]
+        },
+        "witness_ktest_ref": {
+          "type": ["string", "null"],
+          "description": "Required iff outcome=skip_to_phase3."
+        }
+      }
+    },
+
+    "EditSpecRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "spec"],
+      "properties": {
+        "type": { "type": "string", "const": "edit_spec" },
+        "spec": {
+          "description": "Full VulnerabilitySpec replacement. Fields match Spec, but only the user-editable subset is required."
+        }
+      }
+    },
+
+    "SSEMessageKind": {
+      "type": "string",
+      "enum": [
+        "run_status_changed",
+        "run_counters_updated",
+        "spec_state_changed",
+        "spec_intervention_applied",
+        "turn_appended",
+        "worker_heartbeat",
+        "log_line",
+        "resync_required",
+        "interrupt_created",
+        "interrupt_resolved",
+        "auto_config_changed"
+      ],
+      "description": "Discriminator for SSE messages.\n\nFull mapping:\n  run_status_changed       <- backend RunStatusChanged, RunCompleted, RunFailed, RunCancelled\n  run_counters_updated     <- backend RunCountersUpdated (throttled to <=1/sec)\n  spec_state_changed       <- backend SpecPhase2Started, SpecPhase2Outcome, SpecPhase3Started, SpecPhase3Verdict, SpecErrored, SpecRequeued, SpecEmitted, SpecFiltered\n  spec_intervention_applied <- backend SpecInterventionAcknowledged, SpecInterventionApplied\n  turn_appended            <- backend TurnAppended\n  worker_heartbeat         <- backend WorkerHeartbeat (also covers Started/Finished/Died as one stream)\n  log_line                 <- backend LogLine\n  resync_required          <- backend resync signal when bus buffer gap exceeds 60s\n  interrupt_created        <- pipeline reached a function with auto=false and is now waiting (see interactive_control_spec.md §3)\n  interrupt_resolved       <- pipeline resumed past the interrupt (either via resume or skip)\n  auto_config_changed      <- live toggle of an Auto checkbox during a run"
+    },
+
+    "SSEMessage": {
+      "description": "Single SSE message. Wire-level envelope, with `kind` as discriminator.\n\nUNRESOLVED CONFLICTS that this schema explicitly settles:\n  - Field is `sequence`, not `seq`. Backend authoritative.\n  - Payload is NOT a JSON Merge Patch — it is a full snapshot of the changed entity (or relevant subset). Frontend MUST replace, not merge. RFC 7386 was a frontend assumption with no backend support.\n  - `kind` is mandatory on every message including batched messages.\n  - Each `kind` is paired with exactly one payload shape (tagged union at the message level).",
+      "oneOf": [
+        { "$ref": "#/$defs/SSEMessageRunStatusChanged" },
+        { "$ref": "#/$defs/SSEMessageRunCountersUpdated" },
+        { "$ref": "#/$defs/SSEMessageSpecStateChanged" },
+        { "$ref": "#/$defs/SSEMessageSpecInterventionApplied" },
+        { "$ref": "#/$defs/SSEMessageTurnAppended" },
+        { "$ref": "#/$defs/SSEMessageWorkerHeartbeat" },
+        { "$ref": "#/$defs/SSEMessageLogLine" },
+        { "$ref": "#/$defs/SSEMessageResyncRequired" },
+        { "$ref": "#/$defs/SSEMessageInterruptCreated" },
+        { "$ref": "#/$defs/SSEMessageInterruptResolved" },
+        { "$ref": "#/$defs/SSEMessageAutoConfigChanged" }
+      ]
+    },
+
+    "SSEMessageEnvelopeBase": {
+      "type": "object",
+      "description": "Internal: shared envelope fields. Each concrete message extends this with `kind` pinned to a const and `payload` typed to the matching variant.",
+      "additionalProperties": false,
+      "required": ["topic", "sequence", "timestamp", "kind", "payload"],
+      "properties": {
+        "topic":     { "type": "string" },
+        "sequence":  { "type": "integer", "minimum": 0 },
+        "timestamp": { "type": "string", "format": "date-time" }
+      }
+    },
+
+    "SSEMessageRunStatusChanged": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["topic", "sequence", "timestamp", "kind", "payload"],
+      "properties": {
+        "topic":     { "type": "string" },
+        "sequence":  { "type": "integer", "minimum": 0 },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "kind":      { "type": "string", "const": "run_status_changed" },
+        "payload":   { "$ref": "#/$defs/RunStatusChangedPayload" }
+      }
+    },
+
+    "SSEMessageRunCountersUpdated": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["topic", "sequence", "timestamp", "kind", "payload"],
+      "properties": {
+        "topic":     { "type": "string" },
+        "sequence":  { "type": "integer", "minimum": 0 },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "kind":      { "type": "string", "const": "run_counters_updated" },
+        "payload":   { "$ref": "#/$defs/RunCountersUpdatedPayload" }
+      }
+    },
+
+    "SSEMessageSpecStateChanged": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["topic", "sequence", "timestamp", "kind", "payload"],
+      "properties": {
+        "topic":     { "type": "string" },
+        "sequence":  { "type": "integer", "minimum": 0 },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "kind":      { "type": "string", "const": "spec_state_changed" },
+        "payload":   { "$ref": "#/$defs/SpecStateChangedPayload" }
+      }
+    },
+
+    "SSEMessageSpecInterventionApplied": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["topic", "sequence", "timestamp", "kind", "payload"],
+      "properties": {
+        "topic":     { "type": "string" },
+        "sequence":  { "type": "integer", "minimum": 0 },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "kind":      { "type": "string", "const": "spec_intervention_applied" },
+        "payload":   { "$ref": "#/$defs/SpecInterventionAppliedPayload" }
+      }
+    },
+
+    "SSEMessageTurnAppended": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["topic", "sequence", "timestamp", "kind", "payload"],
+      "properties": {
+        "topic":     { "type": "string" },
+        "sequence":  { "type": "integer", "minimum": 0 },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "kind":      { "type": "string", "const": "turn_appended" },
+        "payload":   { "$ref": "#/$defs/TurnAppendedPayload" }
+      }
+    },
+
+    "SSEMessageWorkerHeartbeat": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["topic", "sequence", "timestamp", "kind", "payload"],
+      "properties": {
+        "topic":     { "type": "string" },
+        "sequence":  { "type": "integer", "minimum": 0 },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "kind":      { "type": "string", "const": "worker_heartbeat" },
+        "payload":   { "$ref": "#/$defs/WorkerHeartbeatPayload" }
+      }
+    },
+
+    "SSEMessageLogLine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["topic", "sequence", "timestamp", "kind", "payload"],
+      "properties": {
+        "topic":     { "type": "string" },
+        "sequence":  { "type": "integer", "minimum": 0 },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "kind":      { "type": "string", "const": "log_line" },
+        "payload":   { "$ref": "#/$defs/LogLinePayload" }
+      }
+    },
+
+    "SSEMessageResyncRequired": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["topic", "sequence", "timestamp", "kind", "payload"],
+      "properties": {
+        "topic":     { "type": "string" },
+        "sequence":  { "type": "integer", "minimum": 0 },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "kind":      { "type": "string", "const": "resync_required" },
+        "payload":   { "$ref": "#/$defs/ResyncRequiredPayload" }
+      }
+    },
+
+    "SSEMessageInterruptCreated": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["topic", "sequence", "timestamp", "kind", "payload"],
+      "properties": {
+        "topic":     { "type": "string" },
+        "sequence":  { "type": "integer", "minimum": 0 },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "kind":      { "type": "string", "const": "interrupt_created" },
+        "payload":   { "$ref": "#/$defs/InterruptCreatedPayload" }
+      }
+    },
+
+    "SSEMessageInterruptResolved": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["topic", "sequence", "timestamp", "kind", "payload"],
+      "properties": {
+        "topic":     { "type": "string" },
+        "sequence":  { "type": "integer", "minimum": 0 },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "kind":      { "type": "string", "const": "interrupt_resolved" },
+        "payload":   { "$ref": "#/$defs/InterruptResolvedPayload" }
+      }
+    },
+
+    "SSEMessageAutoConfigChanged": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["topic", "sequence", "timestamp", "kind", "payload"],
+      "properties": {
+        "topic":     { "type": "string" },
+        "sequence":  { "type": "integer", "minimum": 0 },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "kind":      { "type": "string", "const": "auto_config_changed" },
+        "payload":   { "$ref": "#/$defs/AutoConfigChangedPayload" }
+      }
+    },
+
+    "RunStatusChangedPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "status"],
+      "properties": {
+        "run_id":          { "type": "string" },
+        "status":          { "$ref": "#/$defs/RunStatus" },
+        "previous_status": { "$ref": "#/$defs/RunStatus" },
+        "error":           { "type": ["string", "null"] }
+      }
+    },
+
+    "RunCountersUpdatedPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "counters"],
+      "properties": {
+        "run_id":   { "type": "string" },
+        "counters": { "$ref": "#/$defs/RunCounters" }
+      }
+    },
+
+    "SpecStateChangedPayload": {
+      "type": "object",
+      "description": "Full snapshot of the spec after the change. NOT a partial diff.",
+      "additionalProperties": false,
+      "required": ["spec"],
+      "properties": {
+        "spec": { "$ref": "#/$defs/Spec" }
+      }
+    },
+
+    "SpecInterventionAppliedPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["spec_id", "intervention_type", "applied_at"],
+      "properties": {
+        "spec_id":           { "type": "string" },
+        "intervention_type": { "type": "string", "enum": ["edit_harness", "force_outcome", "edit_spec"] },
+        "applied_at":        { "type": "string", "format": "date-time" },
+        "actor":             { "type": ["string", "null"] }
+      }
+    },
+
+    "TurnAppendedPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["turn"],
+      "properties": {
+        "turn": { "$ref": "#/$defs/Turn" }
+      }
+    },
+
+    "WorkerHeartbeatPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["worker_id", "status", "last_heartbeat"],
+      "properties": {
+        "worker_id":      { "type": "string" },
+        "status":         { "type": "string", "enum": ["idle", "busy", "died"] },
+        "current_spec_id":{ "type": ["string", "null"] },
+        "last_heartbeat": { "type": "string", "format": "date-time" },
+        "throughput_specs_per_min": { "type": ["number", "null"] },
+        "tokens_per_min":           { "type": ["number", "null"] },
+        "klee_seconds_per_min":     { "type": ["number", "null"] }
+      }
+    },
+
+    "LogLinePayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["timestamp", "level", "source", "message"],
+      "properties": {
+        "timestamp": { "type": "string", "format": "date-time" },
+        "level":     { "type": "string", "enum": ["error", "warn", "info", "debug"] },
+        "source":    { "type": "string", "enum": ["celery", "phase1", "phase2", "phase3", "llm", "klee", "clang", "asan", "api"] },
+        "run_id":    { "type": ["string", "null"] },
+        "spec_id":   { "type": ["string", "null"] },
+        "worker_id": { "type": ["string", "null"] },
+        "trace_id":  { "type": ["string", "null"] },
+        "message":   { "type": "string" },
+        "fields":    { "type": "object", "additionalProperties": true }
+      }
+    },
+
+    "ResyncRequiredPayload": {
+      "type": "object",
+      "description": "Sent when the server's replay buffer (60s) cannot catch the client up.\nClient MUST drop local state for affected topic and refetch via REST.",
+      "additionalProperties": false,
+      "required": ["reason"],
+      "properties": {
+        "reason":          { "type": "string", "enum": ["buffer_overflow", "topic_subscription_reset", "unknown"] },
+        "last_known_sequence": { "type": ["integer", "null"] }
+      }
+    },
+
+    "SSEBatch": {
+      "type": "object",
+      "description": "Server batches SSEMessage in 250ms windows per topic. Sent on the wire as the SSE 'data:' payload.",
+      "additionalProperties": false,
+      "required": ["topic", "sequence", "batch"],
+      "properties": {
+        "topic":    { "type": "string" },
+        "sequence": { "type": "integer", "minimum": 0, "description": "Sequence of the last message in batch." },
+        "batch": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/SSEMessage" },
+          "minItems": 1
+        }
+      }
+    },
+
+    "SSETopicPattern": {
+      "type": "string",
+      "description": "Allowed topic patterns:\n  runs.all\n  runs.<run_id>\n  runs.<run_id>.specs\n  runs.<run_id>.specs.<spec_id>\n  runs.<run_id>.specs.<spec_id>.logs\n  runs.<run_id>.workers\n  runs.<run_id>.logs",
+      "pattern": "^runs\\.(all|[A-Za-z0-9_-]+(\\.(specs|workers|logs)(\\.[A-Za-z0-9_-]+(\\.logs)?)?)?)$"
+    },
+
+    "ApiError": {
+      "type": "object",
+      "description": "Uniform error response shape. Returned with all non-2xx responses.\nReplaces the frontend client's ad-hoc {code, message, detail}.",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code":    { "type": "string", "description": "Stable machine-readable code, snake_case. e.g. 'spec_not_found', 'invalid_transition', 'lease_expired'." },
+        "message": { "type": "string", "description": "Human-readable summary." },
+        "detail":  {},
+        "trace_id":{ "type": ["string", "null"] }
+      }
+    },
+
+    "PaginatedSpecs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["items", "next_cursor"],
+      "properties": {
+        "items":       { "type": "array", "items": { "$ref": "#/$defs/Spec" } },
+        "next_cursor": { "type": ["string", "null"] },
+        "prev_cursor": { "type": ["string", "null"] },
+        "total_estimate": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+
+    "Worker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["worker_id", "status", "last_heartbeat"],
+      "properties": {
+        "worker_id":               { "type": "string" },
+        "status":                  { "type": "string", "enum": ["idle", "busy", "died"] },
+        "current_spec_id":         { "type": ["string", "null"] },
+        "last_heartbeat":          { "type": "string", "format": "date-time" },
+        "throughput_specs_per_min":{ "type": ["number", "null"] },
+        "tokens_per_min":          { "type": ["number", "null"] },
+        "klee_seconds_per_min":    { "type": ["number", "null"] }
+      }
+    },
+
+    "User": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["user_id", "username", "role", "created_at"],
+      "properties": {
+        "user_id":      { "type": "string" },
+        "username":     { "type": "string" },
+        "email":        { "type": ["string", "null"], "format": "email" },
+        "display_name": { "type": ["string", "null"] },
+        "role":         { "$ref": "#/$defs/UserRole" },
+        "created_at":   { "type": "string", "format": "date-time" },
+        "last_login":   { "type": ["string", "null"], "format": "date-time" },
+        "disabled":     { "type": "boolean", "default": false }
+      }
+    },
+
+    "AuditEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["event_id", "actor", "action", "target", "created_at"],
+      "properties": {
+        "event_id":   { "type": "string" },
+        "actor":      { "type": "string", "description": "user id" },
+        "action": {
+          "type": "string",
+          "enum": [
+            "run_create", "run_pause", "run_resume", "run_cancel",
+            "spec_requeue", "spec_intervene", "spec_skip",
+            "settings_change", "role_change", "login", "logout",
+            "interrupt_resume", "interrupt_skip", "auto_config_change",
+            "file_replace", "user_register"
+          ]
+        },
+        "target":     { "type": "string", "description": "e.g. 'run:<id>' or 'spec:<id>'" },
+        "diff":       { "type": ["object", "null"], "additionalProperties": true },
+        "created_at": { "type": "string", "format": "date-time" }
+      }
+    },
+
+    "PipelineFunctionId": {
+      "type": "string",
+      "description": "Stable identifier for an interruptible pipeline function.\n\nNaming convention: <phase>_<function>, snake_case, NO DOTS.\nUsed as the AutoConfig key, the interrupt point's `function_name`,\nand the wire-level identifier in every interrupt-related endpoint.\n\nDisplay labels (e.g. 'KLEE Execution') belong in the frontend label table,\nnot here. The wire format is exactly these strings.",
+      "enum": [
+        "phase1_db_build",
+        "phase1_query_execution",
+        "phase1_sarif_parsing",
+        "phase1_fact_enrichment",
+        "phase1_spec_generation",
+        "phase2_spec_selection",
+        "phase2_source_exploration",
+        "phase2_driver_synthesis",
+        "phase2_stub_synthesis",
+        "phase2_compile_diagnose",
+        "phase2_klee_execution",
+        "phase3_replay_driver_generation",
+        "phase3_asan_compilation",
+        "phase3_result_classification"
+      ]
+    },
+
+    "InterruptScope": {
+      "type": "string",
+      "enum": ["run", "spec"],
+      "description": "Whether the interrupt blocks the whole run (Phase 1 functions) or just one spec (Phase 2/3 functions).\n\n  run-scoped:  phase1_*, phase2_spec_selection\n               One interrupt blocks Phase 2 dispatch entirely until resolved.\n  spec-scoped: phase2_source_exploration through phase3_result_classification\n               Per-spec; other specs in the same run continue independently.\n\nResolves interactive_control_spec.md §7.5 Open Question."
+    },
+
+    "InterruptStatus": {
+      "type": "string",
+      "enum": ["waiting", "resumed", "skipped"]
+    },
+
+    "InterruptPoint": {
+      "type": "object",
+      "description": "An active or historical interrupt. Returned by GET /api/runs/:run_id/interrupts(/:interrupt_id).\nSee interactive_control_spec.md §3 for UI behavior.",
+      "additionalProperties": false,
+      "required": [
+        "interrupt_id",
+        "run_id",
+        "function_name",
+        "scope",
+        "status",
+        "created_at"
+      ],
+      "properties": {
+        "interrupt_id":   { "type": "string" },
+        "run_id":         { "type": "string" },
+        "spec_id":        { "type": ["string", "null"], "description": "Null for run-scoped interrupts (Phase 1, spec_selection). Required for spec-scoped." },
+        "function_name":  { "$ref": "#/$defs/PipelineFunctionId" },
+        "scope":          { "$ref": "#/$defs/InterruptScope" },
+        "turn":           { "type": ["integer", "null"], "minimum": 0, "description": "Phase 2 turn number when the interrupt fired; null for Phase 1/3." },
+        "status":         { "$ref": "#/$defs/InterruptStatus" },
+        "created_at":     { "type": "string", "format": "date-time" },
+        "resolved_at":    { "type": ["string", "null"], "format": "date-time" },
+        "resolved_by":    { "type": ["string", "null"], "description": "User id of the intervener who resumed/skipped." },
+        "input_files":    {
+          "type": "array",
+          "description": "Files the user may View/Edit/Replace at this interrupt. Each entry's `artifact_ref` is an opaque reference resolvable via GET /api/artifacts/:ref (returns 302 to presigned URL).",
+          "items": { "$ref": "#/$defs/InterruptInputFile" }
+        },
+        "option_overrides": {
+          "type": "object",
+          "description": "Per-function option set the user may adjust at this interrupt. Schema depends on `function_name`; documented in interactive_control_spec.md §3.4 through §3.18.",
+          "additionalProperties": true
+        }
+      }
+    },
+
+    "InterruptInputFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "artifact_ref", "size_bytes", "mime_type", "editable"],
+      "properties": {
+        "name":         { "type": "string", "description": "Logical file name shown to the user, e.g. 'driver.c', 'findings.sarif'." },
+        "artifact_ref": { "type": "string", "description": "Opaque artifact store reference. Fetch via GET /api/artifacts/:ref." },
+        "size_bytes":   { "type": "integer", "minimum": 0 },
+        "mime_type":    { "type": "string" },
+        "editable":     { "type": "boolean", "description": "True for text formats (C, JSON, SARIF, QL). False for binary (.ktest, .bc) — view-only." },
+        "version":      { "type": ["integer", "null"], "minimum": 0, "description": "Version counter for optimistic concurrency on subsequent edits." }
+      }
+    },
+
+    "InterruptResumeRequest": {
+      "type": "object",
+      "description": "POST /api/runs/:run_id/interrupts/:interrupt_id/resume body.\n\nFile uploads MUST be performed first via POST /api/runs/:run_id/interrupts/:interrupt_id/files (one call per file, returns artifact_ref). The resume body then references the new artifact_ref values. This avoids large base64 payloads in the resume call and keeps file validation visible as its own step.",
+      "additionalProperties": false,
+      "properties": {
+        "modified_files": {
+          "type": "array",
+          "description": "Files the user replaced or edited, referenced by artifact_ref returned from the upload endpoint. Each entry's `name` must match an `InterruptPoint.input_files[*].name` from this interrupt; unknown names are rejected.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "artifact_ref"],
+            "properties": {
+              "name":         { "type": "string" },
+              "artifact_ref": { "type": "string" },
+              "base_version": { "type": ["integer", "null"], "minimum": 0, "description": "Optimistic concurrency token. Must equal the current InterruptInputFile.version; 409 on mismatch." }
+            }
+          }
+        },
+        "option_overrides": {
+          "type": "object",
+          "description": "Per-function override values. Validated against the function's option schema; unknown keys rejected.",
+          "additionalProperties": true
+        },
+        "apply_to_all_matching": {
+          "type": "boolean",
+          "default": false,
+          "description": "Resolves interactive_control_spec.md §7.1 Open Question. When true, the same overrides are applied to all currently-waiting interrupts with the same function_name in this run (e.g., 128 KLEE Execution interrupts). modified_files MUST be empty when this is true (per-spec file edits cannot be broadcast)."
+        },
+        "re_enable_auto": {
+          "type": "boolean",
+          "default": false,
+          "description": "Toggle the AutoConfig for this function_name back to true after resuming. Saves the user one extra round-trip when they only wanted to pause once."
+        }
+      }
+    },
+
+    "InterruptSkipRequest": {
+      "type": "object",
+      "description": "POST /api/runs/:run_id/interrupts/:interrupt_id/skip body.\n\nSkip means: use the default output of the function (the LLM-generated artifact, the auto-classified verdict, etc.) and proceed. Distinct from `spec.skip` which marks the whole spec as not-processed.",
+      "additionalProperties": false,
+      "properties": {
+        "reason": { "type": ["string", "null"], "maxLength": 500 },
+        "apply_to_all_matching": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+
+    "AutoConfig": {
+      "type": "object",
+      "description": "Per-run Auto/Manual configuration. Keys are PipelineFunctionId values; value true=Auto, false=interrupt and wait.\n\nA missing key defaults to true (Auto). Implementations MUST persist only the explicit overrides, not the full set.",
+      "additionalProperties": false,
+      "properties": {
+        "phase1_db_build":                  { "type": "boolean" },
+        "phase1_query_execution":           { "type": "boolean" },
+        "phase1_sarif_parsing":             { "type": "boolean" },
+        "phase1_fact_enrichment":           { "type": "boolean" },
+        "phase1_spec_generation":           { "type": "boolean" },
+        "phase2_spec_selection":            { "type": "boolean" },
+        "phase2_source_exploration":        { "type": "boolean" },
+        "phase2_driver_synthesis":          { "type": "boolean" },
+        "phase2_stub_synthesis":            { "type": "boolean" },
+        "phase2_compile_diagnose":          { "type": "boolean" },
+        "phase2_klee_execution":            { "type": "boolean" },
+        "phase3_replay_driver_generation":  { "type": "boolean" },
+        "phase3_asan_compilation":          { "type": "boolean" },
+        "phase3_result_classification":     { "type": "boolean" }
+      }
+    },
+
+    "AutoConfigPatch": {
+      "type": "object",
+      "description": "PATCH /api/runs/:run_id/auto-config body. Partial update; only included keys are changed.\n\nWire format is the FLAT map below — NOT nested under 'phase1'/'phase2'/'phase3', and NOT using dotted keys like 'phase2.klee_execution'. Reason: dotted JSON keys round-trip badly through typed languages; nesting adds parse complexity for no benefit.",
+      "additionalProperties": false,
+      "properties": {
+        "phase1_db_build":                  { "type": "boolean" },
+        "phase1_query_execution":           { "type": "boolean" },
+        "phase1_sarif_parsing":             { "type": "boolean" },
+        "phase1_fact_enrichment":           { "type": "boolean" },
+        "phase1_spec_generation":           { "type": "boolean" },
+        "phase2_spec_selection":            { "type": "boolean" },
+        "phase2_source_exploration":        { "type": "boolean" },
+        "phase2_driver_synthesis":          { "type": "boolean" },
+        "phase2_stub_synthesis":            { "type": "boolean" },
+        "phase2_compile_diagnose":          { "type": "boolean" },
+        "phase2_klee_execution":            { "type": "boolean" },
+        "phase3_replay_driver_generation":  { "type": "boolean" },
+        "phase3_asan_compilation":          { "type": "boolean" },
+        "phase3_result_classification":     { "type": "boolean" }
+      }
+    },
+
+    "FileValidationSeverity": {
+      "type": "string",
+      "enum": ["error", "warning", "info"]
+    },
+
+    "FileValidationResult": {
+      "type": "object",
+      "description": "Response from POST /api/validate/file and from the implicit validation that runs when a file is uploaded to an interrupt.\n\nNOT an error response — even severity='error' results return HTTP 200. ApiError is only for endpoint-level failures (auth, not found, server error). Validation errors are returned in the body so the UI can render them inline.",
+      "additionalProperties": false,
+      "required": ["valid", "severity", "message", "detected_format"],
+      "properties": {
+        "valid":           { "type": "boolean", "description": "Convenience: true iff severity != 'error'. Severity is authoritative." },
+        "severity":        { "$ref": "#/$defs/FileValidationSeverity" },
+        "message":         { "type": "string", "description": "Human-readable summary." },
+        "detected_format": { "type": "string", "description": "What the validator inferred the file to be, e.g. 'sarif', 'c-source', 'json-array', 'ktest', 'bitcode', 'unknown'." },
+        "issues": {
+          "type": "array",
+          "description": "Granular issues for inline display (e.g. clang error lines, JSON schema violations). Empty when severity='info'.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["severity", "message"],
+            "properties": {
+              "severity": { "$ref": "#/$defs/FileValidationSeverity" },
+              "message":  { "type": "string" },
+              "line":     { "type": ["integer", "null"], "minimum": 1 },
+              "column":   { "type": ["integer", "null"], "minimum": 1 },
+              "rule":     { "type": ["string", "null"], "description": "Validator-specific rule id, e.g. 'sarif.missing_runs', 'replay_driver.klee_call_present'." }
+            }
+          }
+        }
+      }
+    },
+
+    "InterruptCreatedPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["interrupt"],
+      "properties": {
+        "interrupt": { "$ref": "#/$defs/InterruptPoint" }
+      }
+    },
+
+    "InterruptResolvedPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["interrupt_id", "run_id", "resolution"],
+      "properties": {
+        "interrupt_id": { "type": "string" },
+        "run_id":       { "type": "string" },
+        "spec_id":      { "type": ["string", "null"] },
+        "resolution":   { "type": "string", "enum": ["resumed", "skipped"] },
+        "resolved_by":  { "type": ["string", "null"] }
+      }
+    },
+
+    "AutoConfigChangedPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "auto_config"],
+      "properties": {
+        "run_id":      { "type": "string" },
+        "auto_config": { "$ref": "#/$defs/AutoConfig" },
+        "changed_by":  { "type": ["string", "null"] }
+      }
+    },
+
+    "ManualHarnessMode": {
+      "type": "object",
+      "description": "Resolves interactive_control_spec.md §3.15 ambiguity: 'Disable LLM' is a per-spec configuration toggle, NOT a per-turn interrupt.\n\nWhen enabled, the worker treats phase2_driver_synthesis, phase2_stub_synthesis, and (where applicable) phase2_compile_diagnose as if auto=false — but ONLY for this one spec, without modifying the run-level AutoConfig. The spec stays in this mode until the user explicitly disables it via POST .../manual-harness with enabled=false. Re-queueing the spec preserves the flag.",
+      "additionalProperties": false,
+      "required": ["spec_id", "enabled"],
+      "properties": {
+        "spec_id":    { "type": "string" },
+        "enabled":    { "type": "boolean" },
+        "enabled_at": { "type": ["string", "null"], "format": "date-time" }
+      }
+    },
+
+    "RegisterRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["username", "email", "password"],
+      "properties": {
+        "username":     { "type": "string", "minLength": 3, "maxLength": 32, "pattern": "^[A-Za-z0-9_]+$" },
+        "email":        { "type": "string", "format": "email" },
+        "password":     { "type": "string", "minLength": 12, "description": "Server validates strength: ≥1 uppercase, ≥1 digit, ≥1 symbol. Specific regex documented in backend implementation." },
+        "display_name": { "type": ["string", "null"], "maxLength": 64 }
+      }
+    },
+
+    "RegisterResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["user_id", "username", "role"],
+      "properties": {
+        "user_id":  { "type": "string" },
+        "username": { "type": "string" },
+        "role":     { "$ref": "#/$defs/UserRole", "description": "Always 'viewer' except for the very first registered user, who receives 'admin'." }
+      }
+    },
+
+    "ClassifyVerdictRequest": {
+      "type": "object",
+      "description": "Body for the override path of the phase3_result_classification interrupt. Sent in InterruptResumeRequest.option_overrides under the key 'classification'.",
+      "additionalProperties": false,
+      "required": ["verdict"],
+      "properties": {
+        "verdict": {
+          "type": "string",
+          "enum": ["confirmed", "rejected"],
+          "description": "Lowercase wire format. UI may capitalize for display; backend rejects 'CONFIRMED'."
+        },
+        "cwe":    { "type": ["string", "null"], "description": "Optional CWE override, e.g. 'CWE-122'." },
+        "reason": { "type": ["string", "null"], "maxLength": 1000 }
+      }
+    }
+  }
+}
