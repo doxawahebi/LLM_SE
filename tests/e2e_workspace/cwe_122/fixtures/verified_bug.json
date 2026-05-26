@@ -1,0 +1,35 @@
+{
+  "spec_id": "local/cpp/cwe-120-overflow:/home/cks/Project/SE-LLM-project/tests/e2e_workspace/cwe_122/target.c:6",
+  "verdict": "CONFIRMED",
+  "cwe": "CWE-122",
+  "file": "/workspace/e2e-cwe_122/src/target.c",
+  "line": 6,
+  "func": "vulnerable",
+  "asan_type": "heap-buffer-overflow",
+  "asan_report": {
+    "violation_type": "heap-buffer-overflow",
+    "file": "/workspace/e2e-cwe_122/src/target.c",
+    "line": 6,
+    "func": "vulnerable",
+    "stack_trace": "ERROR: AddressSanitizer: heap-buffer-overflow on address 0x602000000012 at pc 0x587c10f7b52a bp 0x7ffc24d72610 sp 0x7ffc24d71de0\nWRITE of size 3 at 0x602000000012 thread T0\n    #0 0x587c10f7b529 in __asan_memcpy (/workspace/e2e-cwe_122/replay/reproducer+0xa0529) (BuildId: 006e1d8cd6ca55a45356b276f3b8d687bfd367c8)\n    #1 0x587c10fb6f2b in vulnerable /workspace/e2e-cwe_122/src/target.c:6:5\n    #2 0x587c10fb6eeb in main /workspace/e2e-cwe_122/replay/replay_driver.c:33:5\n    #3 0x7b431fd34d8f  (/lib/x86_64-linux-gnu/libc.so.6+0x29d8f) (BuildId: 4f7b0c955c3d81d7cac1501a2498b69d1d82bfe7)\n    #4 0x7b431fd34e3f in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29e3f) (BuildId: 4f7b0c955c3d81d7cac1501a2498b69d1d82bfe7)\n    #5 0x587c10ef9304 in _start (/workspace/e2e-cwe_122/replay/reproducer+0x1e304) (BuildId: 006e1d8cd6ca55a45356b276f3b8d687bfd367c8)\n\n0x602000000012 is located 0 bytes to the right of 2-byte region [0x602000000010,0x602000000012)\nallocated by thread T0 here:\n    #0 0x587c10f7c338 in __interceptor_calloc (/workspace/e2e-cwe_122/replay/reproducer+0xa1338) (BuildId: 006e1d8cd6ca55a45356b276f3b8d687bfd367c8)\n    #1 0x587c10fb6eb2 in main /workspace/e2e-cwe_122/replay/replay_driver.c:24:26",
+    "is_in_project_source": true
+  },
+  "inputs": [
+    {
+      "name": "dst_size",
+      "size_bytes": 8,
+      "data_hex": "0200000000000000",
+      "data_interpreted": 2
+    },
+    {
+      "name": "src_size",
+      "size_bytes": 8,
+      "data_hex": "0300000000000000",
+      "data_interpreted": 3
+    }
+  ],
+  "replay_driver_path": "/tmp/pytest-of-cks/pytest-2/test_phase3_confirms_vulnerabi0/phase3/local_cpp_cwe-120-overflow__home_cks_Project_SE-LLM-project_tests_e2e_workspace_cwe_122_target.c_6/replay_driver.c",
+  "asan_report_path": "/tmp/pytest-of-cks/pytest-2/test_phase3_confirms_vulnerabi0/phase3/local_cpp_cwe-120-overflow__home_cks_Project_SE-LLM-project_tests_e2e_workspace_cwe_122_target.c_6/asan_output.txt",
+  "verdict_path": "/tmp/pytest-of-cks/pytest-2/test_phase3_confirms_vulnerabi0/phase3/local_cpp_cwe-120-overflow__home_cks_Project_SE-LLM-project_tests_e2e_workspace_cwe_122_target.c_6/verified_bug.json",
+  "timestamp": "2026-05-24T01:42:02Z"
+}

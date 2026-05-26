@@ -27,8 +27,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from codeql.wrapper import CodeQLRunner
-from models.schemas import Phase1Result, VulnerabilitySpec
+from sailor.codeql.wrapper import CodeQLRunner
+from sailor.models.schemas import Phase1Result, VulnerabilitySpec
 from sailor.codeql.queries import CodeQLQuerySuite
 from sailor.phase1.fact_enrichment import FactEnricher
 from sailor.phase1.fact_generation import FactGenerator
@@ -67,7 +67,8 @@ class Phase1Config:
     codeql_path: str = "codeql"
     codeql_db: Optional[Path] = None
     codeql_home: Optional[Path] = None
-    max_workers: int = 4
+    codeql_search_path: Optional[str] = None
+    max_workers: int = 1
 
     def __post_init__(self) -> None:
         self.project_root = Path(self.project_root).resolve()
@@ -131,6 +132,7 @@ class Phase1Pipeline:
             codeql_path=cfg.codeql_path,
             db_path=db_path,
             timeout=3600,
+            search_path=cfg.codeql_search_path,
         )
 
         if not db_path.exists():

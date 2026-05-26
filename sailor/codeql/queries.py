@@ -591,7 +591,6 @@ import cpp
 from ReturnStmt ret, AddressOfExpr addr, LocalVariable lv
 where ret.getExpr() = addr
   and addr.getOperand() = lv.getAnAccess()
-  and lv.isLocal()
   and not lv.isStatic()
 select ret,
   "CWE-416/562: Return of address of stack-local variable '" + lv.getName() +
@@ -616,7 +615,6 @@ import cpp
 from AssignExpr ae, AddressOfExpr addr, LocalVariable lv, FieldAccess fa
 where ae.getRValue() = addr
   and addr.getOperand() = lv.getAnAccess()
-  and lv.isLocal()
   and not lv.isStatic()
   and ae.getLValue() = fa
 select ae,
@@ -664,6 +662,13 @@ class CodeQLQuerySuite:
         """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+
+        # qlpack.yml declares the codeql/cpp-all dependency so `import cpp` resolves.
+        qlpack = output_dir / "qlpack.yml"
+        qlpack.write_text(
+            "name: sailor/custom-queries\nversion: 0.0.1\ndependencies:\n  codeql/cpp-all: \"*\"\n",
+            encoding="utf-8",
+        )
 
         paths: list[Path] = []
         for q in self.custom_queries:

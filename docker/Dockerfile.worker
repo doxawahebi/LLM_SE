@@ -1,0 +1,31 @@
+FROM docker:27 AS docker-cli
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
+
+# Copy the docker CLI binary from the official docker image
+COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
+
+# Install Python dependencies
+COPY backend/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy backend code (tasks/, celery_app.py, config.py, database.py, services/, etc.)
+COPY backend/ ./
+
+# Copy shared contracts used by services/run_service.py and others
+COPY shared/ ./shared/
+
+# Copy sailor package — used by phase tasks via DockerRunner
+COPY sailor/ ./sailor/
+
+# Worker runs tasks.phase1/2/3 from the backend celery app
+CMD ["celery", "-A", "celery_app", "worker", \
+     "--loglevel=info", \
+     "--concurrency=4", \
+     "-Q", "phase1,phase2,phase3"]

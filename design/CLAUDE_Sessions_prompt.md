@@ -506,8 +506,10 @@ Step 0. Read CLAUDE.md in full.
 
 Step 1. Read spec/backend_spec.md in full.
         Read design/CLAUDE_backend.md in full.
-        Read spec/interactive_control_spec.md §5 (Backend API Additions)
-        and §6 (Interrupt State Persistence).
+        Read spec/sse_contract.md in full.
+        Read spec/interactive_control_spec.md §4 (Auto/Manual Mode +
+        Interrupt System) and §5 (Phase-End Download).
+        Read shared/contracts/README.md (conflict resolution log).
 
 Step 2. Verify prerequisites.
         → Session 0 must be complete: docker compose ps
@@ -526,17 +528,47 @@ Step 3. Implement Phase A — Foundation.
   A2. Database models (backend/models/).
       → Implement ALL models per spec/backend_spec.md §2.1
         and design/CLAUDE_backend.md Gap 2.
-      → Include: interrupt_points table (spec/interactive_control_spec.md §6)
-      → Include: auto_config table (spec/interactive_control_spec.md §5.1)
+      → For every column that mirrors a shared contract type, use
+        the exact field names from shared/contracts/sailor_models.py.
+        Critical examples:
+          interrupt_points.function_name  → PipelineFunctionId enum value
+                                            e.g. "phase2_klee_execution"
+                                            (snake_case, NO DOTS)
+          interrupt_points.status         → "waiting"|"resumed"|"skipped"
+          interrupt_points.scope          → "run"|"spec"
+          auto_config.config JSONB        → keys are PipelineFunctionId values,
+                                            values are boolean; flat map,
+                                            NO nested objects, NO dotted keys
+          runs.status                     → RunStatus enum (lowercase)
+          runs.counters JSONB             → RunCounters field names verbatim
+                                            (e.g. specs_total, NOT total_specs)
+          runs.config JSONB               → RunConfig field names verbatim
+                                            (e.g. phase2_t_klee_seconds,
+                                            NOT T_klee or phase2.t_klee_seconds)
+          specs.phase2_status             → Phase2Status enum (includes "errored")
+          specs.phase3_status             → Phase3Status enum (includes
+                                            "not_eligible"; "skipped" does not exist)
+          verdicts.verdict                → VerdictValue ("confirmed"|"rejected",
+                                            lowercase always)
+      → Remove the `phase` integer column from interrupt_points;
+        it is derivable from the function_name prefix (phase1_*, phase2_*, phase3_*).
+      → Include auto_config table (interactive_control_spec.md §4.4).
       → Generate Alembic initial migration.
       → Verify: docker compose exec backend alembic upgrade head
                 docker compose exec postgres psql -U sailor -c "\dt"
                 (all tables must exist, including interrupt_points, auto_config)
 
-  A3. Pydantic schemas (backend/schemas/).
-      → Request/response schemas for all entities.
-      → Discriminated union for Intervention (§6).
-      → EventMessage schema (§5.3).
+  A3. Shared contract models — DO NOT create backend/schemas/ for wire types.
+      → Run: ./scripts/regen_contracts.sh
+        Confirms shared/contracts/sailor_models.py is current.
+      → In backend/pyproject.toml (or requirements), ensure the repo root is
+        on PYTHONPATH so `from shared.contracts.sailor_models import ...` works.
+      → Create backend/schemas/internal.py for backend-internal types only
+        (DB-internal shapes, Celery task argument/result types, audit diffs).
+        Any type that appears in an HTTP request or response body MUST come from
+        shared.contracts.sailor_models, not from backend/schemas/.
+      → Verify: python -c "from shared.contracts.sailor_models import Run, Spec,
+          SSEMessageRunStatusChanged, InterruptPoint, AutoConfigPatch; print('OK')"
 
   A4. Artifact store (backend/services/artifact_service.py).
       → ArtifactStore ABC + MinIOArtifactStore.
@@ -547,105 +579,336 @@ Step 3. Implement Phase A — Foundation.
   A5. Auth (backend/api/auth.py + services/auth_service.py + middleware/auth.py).
       → POST /api/auth/login → JWT access + refresh tokens.
       → POST /api/auth/refresh, POST /api/auth/logout.
-      → POST /api/auth/register (public; first registered user gets admin role).
+      → POST /api/auth/register (public; first registered user gets admin role;
+        uses RegisterRequest / RegisterResponse from shared.contracts.sailor_models).
       → get_current_user() dependency + require_role() decorator.
       → Verify: first registration returns role="admin", second returns role="viewer".
+
+  A6. Idempotency + tracing middleware (do this before any API handler).
+      → middleware/idempotency.py: read Idempotency-Key header; cache
+        (user_id + endpoint + key) → response in Redis 24h TTL;
+        on hit return cached response without calling the handler.
+      → middleware/tracing.py: generate trace_id (UUID4) per request;
+        attach to request.state; propagate to Celery task headers;
+        include in all LogLine events and ApiError responses.
 
 Step 4. Implement Phase B — Core API.
 
   B1. Run operations (backend/api/runs.py + services/run_service.py).
       → POST /api/runs, GET /api/runs, GET /api/runs/:id.
+      → Response model: Run (from shared.contracts.sailor_models).
       → POST /api/runs/:id/pause|resume|cancel|clone.
+      → DELETE /api/runs/:id (soft delete → status="archived").
       → State transitions per spec §3.1 — enforce via UPDATE WHERE.
 
   B2. Spec operations (backend/api/specs.py + services/spec_service.py).
       → GET /api/runs/:id/specs (cursor-paginated, all filter params).
-      → GET /api/runs/:id/specs/:id/turns (summary only).
-      → GET /api/runs/:id/specs/:id/turns/:id (with payload).
+        Response: PaginatedSpecs (from shared.contracts.sailor_models).
+      → GET /api/runs/:id/specs/:spec_id/turns — returns Turn[] (summary only,
+        no inline payload). Response uses Turn schema from shared.contracts.
+      → GET /api/runs/:id/specs/:spec_id/turns/:turn_id — returns TurnDetail
+        (Turn + inlined TurnPayload). This is the ONLY endpoint that returns
+        inline payload. Never inline payload in the list endpoint.
       → POST requeue, skip, bulk-requeue, bulk-skip.
+      → POST /api/runs/:id/specs/:spec_id/manual-harness
+        Body: { enabled: bool }. Response: ManualHarnessMode.
 
   B3. Intervention (backend/api/specs.py §6).
-      → POST /api/runs/:id/specs/:id/intervene.
-      → EditHarness: optimistic concurrency via base_version (→ 409).
+      → POST /api/runs/:id/specs/:spec_id/intervene.
+      → Request body: InterventionRequest discriminated union from
+        shared.contracts.sailor_models. Discriminator field is `type`.
+      → Valid type values: "edit_harness" | "force_outcome" | "edit_spec".
+        "mode_a" / "mode_b" / "mode_c" are NOT valid — reject with 422.
+      → EditHarnessRequest.artifact ∈ {"driver","slice","assertions"} — no .c
+        extension on the wire. 422 if "driver.c" etc. is sent.
+      → EditHarness: optimistic concurrency via base_version (→ 409 on conflict).
 
   B4. Artifacts (backend/api/artifacts.py).
-      → GET /api/runs/:id/specs/:id/artifacts → tree.
-      → GET /api/runs/:id/specs/:id/artifacts/*path → presigned URL redirect.
-      → POST artifacts.tar.gz → enqueue export_task → 202 + job_id.
+      → GET /api/runs/:id/specs/:spec_id/artifacts → tree (refs only; no presigned
+        URLs in the tree listing).
+      → GET /api/runs/:id/specs/:spec_id/artifacts/*path
+        → HTTP 302 to presigned URL (300s TTL). NEVER stream bytes through FastAPI.
+        → No Range header proxying; Range is S3/MinIO's responsibility.
+      → POST /api/runs/:id/specs/:spec_id/artifacts.tar.gz
+        → enqueue export_task, return 202 + job_id.
+      → GET /api/jobs/:job_id → poll export status.
 
   B5. Results, logs, workers.
       → GET /api/runs/:id/results, /logs, /workers, /workers/:id.
       → GET /api/runs/:id/results/compare?other=:id.
 
   B6. Auto/Manual config (backend/api/auto_config.py).
-      → GET  /api/runs/:id/auto-config
-      → PATCH /api/runs/:id/auto-config  (operator role)
+      → GET  /api/runs/:run_id/auto-config             [viewer+]
+            Response 200: AutoConfig
+            (full map; missing keys mean auto=true)
+      → PATCH /api/runs/:run_id/auto-config            [operator+]
+            Body: AutoConfigPatch (from shared.contracts.sailor_models)
+            Keys are PipelineFunctionId values — flat snake_case strings.
+            REJECT any key containing a dot (return 422
+            code="invalid_function_name").
+            Response 200: AutoConfig (full post-update config).
+            Effect: takes effect at next function boundary.
+            Side-effect: publish auto_config_changed SSE event on
+              runs.<run_id> topic. Use SSEMessageAutoConfigChanged from
+              shared.contracts.sailor_models — not a raw dict.
 
   B7. Interrupt panel endpoints (backend/api/interrupts.py).
-      → GET  /api/runs/:id/interrupts
-      → GET  /api/runs/:id/interrupts/:interrupt_id
-      → POST /api/runs/:id/interrupts/:interrupt_id/resume  (intervener role)
-      → POST /api/runs/:id/interrupts/:interrupt_id/skip    (intervener role)
+      → GET  /api/runs/:run_id/interrupts              [viewer+]
+            Query: status (default: waiting), function_name, spec_id, scope
+            Response: paginated list of InterruptPoint.
+      → GET  /api/runs/:run_id/interrupts/:interrupt_id [viewer+]
+            Response: InterruptPoint with input_files populated.
+            Each input_files[*].artifact_ref is an opaque ref resolvable
+            via GET /api/artifacts/:ref (returns 302).
+      → POST /api/runs/:run_id/interrupts/:interrupt_id/files  [intervener+]
+            Multipart upload of one file at a time.
+            Fields: "file" (binary), "name" (logical filename).
+            Effect: uploads to artifact store, runs server-side validation,
+            returns { artifact_ref: str, validation: FileValidationResult }.
+            HTTP 200 even if validation.severity = "error" (see sse_contract.md §9).
+      → POST /api/runs/:run_id/interrupts/:interrupt_id/resume [intervener+]
+            Body: InterruptResumeRequest (from shared.contracts.sailor_models)
+            Fields:
+              modified_files: [{name, artifact_ref, base_version?}]
+                artifact_ref must come from a prior /files upload, not be
+                supplied as raw bytes. 422 if artifact_ref is unknown.
+              option_overrides: validated per-function per
+                interactive_control_spec.md §4.6
+              apply_to_all_matching: bool (default false)
+                If true: modified_files MUST be empty (422 otherwise,
+                code="bulk_modify_with_files").
+              re_enable_auto: bool (default false)
+            Server re-validates all referenced files before resuming.
+            If any has severity=error: return 422 code="validation_failed",
+            detail contains the FileValidationResult.
+            Response 200: { interrupt: InterruptPoint (status="resumed") }
+            Response 409: code="version_mismatch"
+            Side-effect: publish interrupt_resolved SSE event.
+            Audit event: action="interrupt_resume".
+      → POST /api/runs/:run_id/interrupts/:interrupt_id/skip   [intervener+]
+            Body: InterruptSkipRequest (from shared.contracts.sailor_models)
+            Response 200: { interrupt: InterruptPoint (status="skipped") }
+            Side-effect: publish interrupt_resolved SSE event.
+            Audit event: action="interrupt_skip".
 
   B8. File validation (backend/api/validate.py + services/validation_service.py).
-      → POST /api/validate/file (public, stateless)
-      → ValidatorService with all file type validators per design/CLAUDE_backend.md B8.
-      → CSourceValidator runs clang --syntax-only inside DockerRunner.
+      → POST /api/validate/file                        [public, no auth]
+            Body: multipart/form-data with fields:
+              "file"     — binary file content
+              "filename" — logical filename including extension (drives validator
+                           dispatch; "findings.sarif", "driver.c", etc.)
+            Response 200: FileValidationResult (from shared.contracts.sailor_models)
+              { valid, severity, message, detected_format, issues[] }
+            Note: HTTP 200 even when severity="error". ApiError is only for
+            endpoint-level failures (auth, server error).
+      → ValidatorService.validate(filename: str, content: bytes) → FileValidationResult
+        Dispatch table: see interactive_control_spec.md §4.7.
+        CSourceValidator runs clang --syntax-only inside DockerRunner.
+        replay_driver.c validation additionally checks for klee_* call sites
+        (rule id "replay_driver.klee_call_present").
 
   B9. User management (extend backend/api/auth.py).
-      → POST /api/auth/register (already in A5 — verify it's wired to router here)
-      → GET  /api/users, POST /api/users/:id/role, DELETE /api/users/:id  [admin]
+      → POST /api/auth/register — verify wired to router (implemented in A5).
+      → GET  /api/users                                [admin]
+      → POST /api/users/:user_id/role                  [admin]
+            Body: { role: UserRole }
+      → POST /api/users/:user_id/disable               [admin]
+      → POST /api/users/:user_id/enable                [admin]
+      → DELETE /api/users/:user_id                     [admin]
+            Soft delete: anonymize, set disabled=true, preserve audit links.
+            Last admin cannot be deleted (409 code="last_admin").
 
   B10. Phase-level download endpoints (backend/api/phase_downloads.py).
-       → All endpoints per design/CLAUDE_backend.md B10.
-       → All responses: HTTP 302 presigned redirect (300s TTL).
+       → All endpoints per interactive_control_spec.md §5.6.
+       → All file responses: HTTP 302 presigned redirect (300s TTL).
+         NEVER stream bytes through FastAPI (see Constraint 10).
+       → List endpoints return { items: [{ name, size_bytes, mime_type,
+         created_at, artifact_ref }] }. No presigned URLs in list response.
+       → Tarball endpoints ≤ 100MB: return 302 to pre-built tarball, or
+         return 202 + job_id and let client poll GET /api/jobs/:job_id.
 
-Step 5. Implement Phase C — SSE.
+Step 5. Implement Phase C — Real-Time Push (SSE).
+
+  Read spec/sse_contract.md in full before writing any SSE code.
+  Every decision about wire format, auth, reconnect, batching, and
+  keep-alive is made there. Do not invent alternatives.
 
   C1. Event service (backend/services/event_service.py).
-      → Publish events to Redis Pub/Sub per spec §8.
-      → RunCountersUpdated throttled to ≤ 1/second per run.
+      → Publish events to Redis Pub/Sub per sse_contract.md.
+      → Always construct concrete SSEMessage* Pydantic models from
+        shared.contracts.sailor_models before publishing. Never publish raw dicts.
+        Example:
+          msg = SSEMessageRunStatusChanged(
+              topic=f"runs.{run_id}",
+              sequence=next_seq(topic),
+              timestamp=utcnow_iso(),
+              kind="run_status_changed",
+              payload=RunStatusChangedPayload(run_id=run_id, status=new, previous_status=old),
+          )
+          redis.publish(topic, msg.model_dump_json())
+      → run_counters_updated: throttle to ≤ 1/second per run.
+      → spec_state_changed: fan-out to BOTH runs.<run_id>.specs AND
+        runs.<run_id>.specs.<spec_id> (same sequence, different topic field).
+      → All 11 SSE kinds from sse_contract.md §8 must be implemented:
+          run_status_changed, run_counters_updated, spec_state_changed,
+          spec_intervention_applied, turn_appended, worker_heartbeat,
+          log_line, resync_required,
+          interrupt_created, interrupt_resolved, auto_config_changed.
 
   C2. Push service (backend/services/push_service.py).
-      → Per-connection asyncio queue (drop at 1MB).
-      → 250ms flush loop with coalescing.
-      → 60-second replay buffer in Redis LRANGE.
+      → Subscribe to Redis Pub/Sub channels per connection's topic set.
+      → 60-second replay buffer in Redis sorted set per topic
+        (ZADD on publish; ZRANGEBYSCORE on reconnect; trim every 10s).
+      → 250ms batching window per topic; flush as SSEBatch when >1 message
+        accumulated; flush as single SSEMessage otherwise.
+        Use SSEBatch from shared.contracts.sailor_models for construction.
+      → Keep-alive: emit `: keep-alive\n\n` comment every 15 seconds.
+      → Drop connection at 1MB pending queue backlog.
 
   C3. SSE endpoint (backend/api/events.py).
-      → GET /api/events?topics=...&token=<jwt>
-      → Last-Event-ID reconnect + resync_required on gap.
+      → GET /api/events?topics=<comma-separated>&token=<jwt>
+      → Authentication: validate `token` query param — identical check to
+        Authorization header on other endpoints. No other auth mechanism.
+        Missing/invalid token: return 401 ApiError BEFORE opening the stream.
+      → Parse Last-Event-ID header for reconnect. ?since= is NOT supported.
+      → On reconnect with Last-Event-ID: replay from buffer; if gap >60s,
+        emit resync_required (reason="buffer_overflow") then continue live.
+      → Topic validation: reject unknown patterns with 400 code="invalid_topic".
+      → Topic access control: if any topic is forbidden for this user's role,
+        return 403 code="topic_forbidden" for the whole request (fail-closed).
+      → Maximum 32 topics per connection; beyond that return 400
+        code="too_many_topics".
+      → Wire format per sse_contract.md §2.2:
+          id: <sequence>
+          event: <kind | "batch">
+          data: <single-line JSON>
+          (blank line)
 
 Step 6. Implement Phase D — Celery Tasks.
 
   D1. phase1_task (backend/tasks/phase1.py).
-  D2. phase2_task (backend/tasks/phase2.py).
-      → Gemini Flash by default (ANTHROPIC_API_OPTION=false).
-      → Lease heartbeat every 30s.
-      → Control-flag check at every turn boundary.
-      → Interrupt check at every function boundary per design/CLAUDE_backend.md:
-          check auto_config[function_name]; if false → write interrupt_points row,
-          publish SSE event interrupt_created, poll until resumed or skipped.
-      → Apply same interrupt pattern to phase1_task and phase3_task.
-  D3. phase3_task (backend/tasks/phase3.py).
-  D4. export_task (backend/tasks/exports.py).
+      → Input: run_id.
+      → Use DockerRunner to execute Phase 1 inside container.
+      → Call Phase1Pipeline.
+      → Persist Spec rows with deterministic spec_id.
+      → Publish SSE events at each step via event_service.
+      → Apply interrupt check (see D5 below) at each Phase 1
+        function boundary.
 
-Step 7. Implement Phase E — Middleware, Health, Metrics.
-        → Idempotency middleware (Idempotency-Key header → Redis cache).
-        → Tracing middleware (trace_id propagation to Celery).
-        → GET /api/health, GET /api/metrics (Prometheus).
+  D2. phase2_task (backend/tasks/phase2.py).
+      → Input: spec_id, continue_from_intervention=False.
+      → Lease acquisition per spec §9.2.
+      → Lease heartbeat every 30s.
+      → Control-flag check at every turn boundary:
+          1. Check run.status (paused → requeue, cancelled → errored).
+          2. Check intervention_pending → apply per spec §6.
+      → LLM API error → retry with exponential backoff, base 2s, max 5
+        attempts, cap 60s per attempt. This applies to ALL providers
+        including Gemini 429. After 5 failures → mark spec errored.
+      → Apply interrupt check (D5) at each Phase 2 function boundary.
+
+  D3. phase3_task (backend/tasks/phase3.py).
+      → Input: spec_id.
+      → Lease acquisition.
+      → Call Phase3Pipeline via DockerRunner.
+      → Build Verdict row + compute dedup_key.
+      → Apply interrupt check (D5) at each Phase 3 function boundary.
+
+  D4. export_task (backend/tasks/exports.py).
+      → Input: job_id, spec_ids[], export_type.
+      → Stream artifacts from artifact store into tarball.
+      → Write tarball to artifact store.
+      → Update export_jobs row with result ref.
+
+  D5. Interrupt check pattern (used in D1, D2, D3).
+      At every function boundary:
+        function_name = PipelineFunctionId value, e.g. "phase2_klee_execution"
+                        (snake_case, NO DOTS — reject any dotted string)
+
+        config = load_auto_config(run_id)  # flat map from DB
+        if config.get(function_name, True) is False:
+            interrupt = create_interrupt_point(
+                run_id=run_id,
+                spec_id=spec_id,   # None for run-scope functions
+                function_name=function_name,
+                scope="run" if function_name.startswith("phase1_") or
+                      function_name == "phase2_spec_selection" else "spec",
+                turn=current_turn,
+                status="waiting",
+                input_files=[...],
+                option_overrides=current_defaults,
+            )
+            # Publish using shared model — not a raw dict
+            event_service.publish(SSEMessageInterruptCreated(
+                topic=f"runs.{run_id}",
+                ...
+                payload=InterruptCreatedPayload(interrupt=interrupt),
+            ))
+            # Poll until resolved (5s interval)
+            while True:
+                row = db.get_interrupt(interrupt.interrupt_id)
+                if row.status == "resumed":
+                    apply_modified_files(row)   # artifact_refs, not base64
+                    apply_option_overrides(row)
+                    break
+                if row.status == "skipped":
+                    use_default_outputs()
+                    break
+                if run_cancelled():
+                    skip_interrupt(interrupt.interrupt_id, resolved_by="system")
+                    break
+                await asyncio.sleep(5)
+
+      14 supported function names (complete list, no others):
+        phase1_db_build, phase1_query_execution, phase1_sarif_parsing,
+        phase1_fact_enrichment, phase1_spec_generation,
+        phase2_spec_selection, phase2_source_exploration,
+        phase2_driver_synthesis, phase2_stub_synthesis,
+        phase2_compile_diagnose, phase2_klee_execution,
+        phase3_replay_driver_generation, phase3_asan_compilation,
+        phase3_result_classification
+
+      sailor/ pipeline code has NO knowledge of interrupt_points.
+      Interrupt logic lives entirely in backend Celery tasks.
+
+Step 7. Implement Phase E — Health, Metrics.
+        → GET /api/health: check DB, Redis, MinIO connectivity.
+        → GET /api/metrics: Prometheus text format.
+          Metrics: runs_total, specs_total, turn_duration, llm_tokens_total,
+          klee_seconds_total, lease_acquisitions, api_request_duration.
+        (Idempotency and tracing middleware were implemented in A6.)
 
 Step 8. Run tests.
         → pytest backend/tests/ -v
         → mypy backend/ --strict
-        → Verify FastAPI /docs shows all expected endpoints including
-            /api/runs/:id/auto-config, /api/runs/:id/interrupts/*,
-            /api/validate/file, /api/auth/register, phase download endpoints.
+        → Verify FastAPI /docs shows all expected endpoints including:
+            GET/PATCH /api/runs/:id/auto-config
+            GET /api/runs/:id/interrupts
+            GET /api/runs/:id/interrupts/:interrupt_id
+            POST /api/runs/:id/interrupts/:interrupt_id/files
+            POST /api/runs/:id/interrupts/:interrupt_id/resume
+            POST /api/runs/:id/interrupts/:interrupt_id/skip
+            POST /api/validate/file
+            POST /api/auth/register
+            Phase download endpoints
         → pytest backend/tests/test_interrupts.py
-            Test: interrupt created → waiting, resume with modified file, skip.
-            Test: file validation rejects PDF-as-SARIF (returns severity="error").
-            Test: first-user registration gets admin role.
+            Test: interrupt created → waiting, resume with artifact_ref
+                  from a prior /files upload, skip.
+            Test: file validation returns FileValidationResult with issues[].
+            Test: replay_driver.c with klee_make_symbolic → severity=error,
+                  rule="replay_driver.klee_call_present".
+            Test: first-user registration gets role="admin".
+            Test: AutoConfigPatch with dotted key → 422 invalid_function_name.
+            Test: bulk resume apply_to_all_matching with non-empty
+                  modified_files → 422 bulk_modify_with_files.
         → pytest backend/tests/test_phase_downloads.py
             Test: presigned redirect for each phase artifact type.
+        → pytest backend/tests/test_sse.py
+            Test: subscribe with ?token= query param (not Authorization header).
+            Test: 11 SSE kinds all produce valid SSEMessage* models.
+            Test: Last-Event-ID reconnect replays buffer.
+            Test: resync_required on 60s gap.
+            Test: counters throttle ≤ 1/s.
 
 Step 9. Verify full stack in Docker.
         → docker compose up -d --build backend worker
@@ -668,8 +931,11 @@ Step 0. Read CLAUDE.md in full.
 Step 1. Read spec/frontend_spec.md in full.
         Read design/CLAUDE_frontend.md in full.
         Read spec/interactive_control_spec.md in full.
+        Read spec/sse_contract.md in full.
+        Read shared/contracts/README.md.
         (interactive_control_spec.md overrides frontend_spec.md
-         for features described in its §2, §3, §4.)
+         for features described in its §3, §4, §5.
+         sse_contract.md is authoritative for all SSE wire-format details.)
 
 Step 2. Verify prerequisites.
         → Session 9 must be complete: curl http://localhost:8000/api/health
@@ -687,26 +953,83 @@ Step 3. Implement Phase A — Foundation.
       → Configure Tailwind + shadcn/ui init.
       → frontend/Dockerfile (spec: design/CLAUDE_frontend.md).
       → frontend/nginx.conf (API proxy + SPA fallback).
-      → Configure routes: include /register, /settings/users.
+      → Configure routes: include /register, /settings/users,
+        /runs/:run_id/interrupts, /runs/:run_id/interrupts/:interrupt_id.
 
-  A2. Implement frontend/src/lib/types.ts in full.
-      → All TypeScript interfaces from design/CLAUDE_frontend.md.
-      → No placeholder types — every field must match backend schema.
-      → Verify against backend OpenAPI: http://localhost:8000/openapi.json
+  A2. Shared type imports — DO NOT create frontend/src/lib/types.ts for
+      wire types.
+      → Copy or symlink shared/contracts/sailor.types.ts into the
+        frontend's source tree (or configure tsconfig.json paths alias
+        @/shared/contracts → ../../shared/contracts).
+      → Import all wire types from sailor.types:
+          import type { Run, Spec, Turn, TurnDetail, Verdict,
+            RunStatus, Phase2Status, Phase3Status, RunConfig, RunCounters,
+            SSEMessage, SSEBatch, InterruptPoint, AutoConfig, AutoConfigPatch,
+            InterventionRequest, EditHarnessRequest, ForceOutcomeRequest,
+            EditSpecRequest, ApiError, PaginatedSpecs, FileValidationResult,
+            PipelineFunctionId } from '@/shared/contracts/sailor.types';
+      → Create frontend/src/lib/pipelineLabels.ts:
+          A map from each PipelineFunctionId value to its display string.
+          Example: { "phase2_klee_execution": "KLEE Execution", ... }
+          This is the ONLY place display labels live. All 14 functions
+          must be present. Never use the raw PipelineFunctionId string as
+          a user-visible label anywhere in the UI.
+      → Create frontend/src/lib/ui-types.ts for purely-UI state that never
+        appears in network payloads (FilterPreset, SpecFilters, ToastSeverity,
+        etc.).
+      → Verify: npm run build must succeed with zero TypeScript errors.
 
   A3. Implement frontend/src/api/client.ts.
-      → axios instance, VITE_API_URL base, Bearer token injection.
-      → 401 → redirect to login, error normalization.
+      → axios instance, VITE_API_URL base.
+      → Auth: inject Authorization: Bearer <jwt> header on every
+        non-SSE request (token from localStorage).
+      → Idempotency: inject Idempotency-Key: <uuid-v4> header on every
+        POST/PATCH/DELETE. Generate a new key per user-initiated action;
+        on programmatic retry of the same intent, reuse the same key.
+      → 401 → redirect to /login; clear stored token.
+      → Error normalization: non-2xx responses are typed as ApiError.
+        The UI branches on ApiError.code, not solely on HTTP status.
 
   A4. Implement hooks/useSSE.ts.
-      → EventSource with ?token= auth param.
-      → Reconnect: exponential backoff (1s, 2s, 4s, max 30s).
-      → Last-Event-ID reconnect + resync_required handling.
-      → JSON Merge Patch (RFC 7386) applied to Zustand stores.
+      All wire-format decisions come from sse_contract.md. Do not invent.
+      Key rules:
+      → Connection URL: /api/events?topics=<comma-separated>&token=<jwt>
+        (token in query param — EventSource cannot send custom headers).
+      → Use native EventSource. The browser handles reconnect automatically
+        with Last-Event-ID. Do NOT implement manual exponential backoff in
+        JavaScript; that would fight the browser's built-in reconnect.
+      → On message: parse JSON. If JSON contains a "batch" key it is an
+        SSEBatch (dispatch each inner SSEMessage in sequence order).
+        Otherwise dispatch the SSEMessage directly.
+      → Dispatcher: exhaustive switch on msg.kind. TypeScript must compile
+        without errors, meaning all 11 kinds need a case. Add a compile-time
+        assertion at the bottom of the switch to catch new kinds:
+          default: {
+            const _exhaustive: never = msg;  // compile error if any kind missing
+          }
+      → The payload is a snapshot — replace the local entity by primary
+        key. Never apply any patch or merge to incoming SSE data. The server
+        sends full snapshots; the client replaces its local copy entirely.
+      → Per-topic sequence deduplication: ignore any message whose sequence
+        ≤ last_seen_sequence for that topic.
+      → On resync_required: drop local cache for the affected topic,
+        refetch via REST, reset last_seen_sequence to null for that topic.
+      → The 11 kinds and their payload shapes are in sse_contract.md §8.
+        Use the JSON examples in shared/contracts/examples/sse/ as test fixtures.
 
   A5. Implement hooks/useSpecStore.ts + hooks/useRunStore.ts.
-      → useSpecStore: Map<spec_id, Spec> + applyDiff().
-      → useRunStore: Run + applyDiff() + control actions.
+      → useSpecStore: Map<spec_id, Spec>.
+          upsert(spec: Spec): replace the local copy entirely (snapshot, not diff).
+          clearForRun(run_id: string): drop all specs for a resync.
+      → useRunStore: stores Run + live AutoConfig.
+          setStatus(run_id, status): partial update.
+          setCounters(run_id, counters: RunCounters): replace counters.
+          setAutoConfig(run_id, config: AutoConfig): replace config.
+      → useInterruptStore: Map<interrupt_id, InterruptPoint>.
+          upsert(ip: InterruptPoint).
+          markResolved(interrupt_id, resolution).
+      → Never patch or diff incoming SSE data. upsert() always replaces the
+        full entity from the snapshot in the payload.
 
 Step 4. Implement Phase B — Core Views.
 
@@ -715,18 +1038,21 @@ Step 4. Implement Phase B — Core Views.
       → Subscribes to runs.all SSE topic.
 
   B2. New Run (/runs/new).
-      → All form inputs from spec §1.
+      → All form inputs from spec §1, using RunConfig field names
+        (phase2_t_explore, phase2_t_klee_seconds, etc. — not T_explore, T_klee).
       → Zip upload with drag-and-drop.
 
   B3. Run Detail header (/runs/:run_id).
       → Live phase progress bars.
       → Pause/Resume/Cancel/Re-run controls.
+      → PipelineControlsSidebar: collapsible panel with AutoCheckbox per
+        function. See §4.9 of interactive_control_spec.md.
 
   B4. Spec Table (core of §3b).
       → TanStack Virtual — 30K rows at 60fps. Non-negotiable.
       → All columns, filter bar, URL-encoded filters via nuqs.
       → Saved filter presets, right-click context menu.
-      → Subscribes to runs.:id.specs SSE topic.
+      → Subscribes to runs.<run_id>.specs SSE topic.
 
   B5. Charts Strip (§3c).
       → Phase 2 outcomes stacked area (Recharts).
@@ -735,16 +1061,65 @@ Step 4. Implement Phase B — Core Views.
 Step 5. Implement Phase C — Spec Detail.
 
   C1. Spec Header (§4a): JSON collapsible + phase chips.
-  C2. Timeline (§4b): lazy-load payloads on click. Never fetch all on mount.
+  C2. Timeline (§4b): lazy-load payloads on click via GET turns/:turn_id.
+      Never fetch all turn payloads on mount (list endpoint has no inline payload).
   C3. Artifact Tree (§4c): file tree + CodeMirror read-only viewer.
-  C4. Intervention Panel (§4d): modes A/B/C + confirmation modal.
+  C4. Intervention Panel (§4d).
+      → Three intervention types: edit_harness, force_outcome, edit_spec.
+        The wire value sent in the `type` field is these exact strings.
+        "Mode A / Mode B / Mode C" are display labels only — do not use
+        them as field values in any request body.
+      → EditHarnessRequest.artifact ∈ {"driver","slice","assertions"} — no .c
+        in the request body. The UI may label tabs "[driver.c]" for display.
       → Warn: "Editing will consume 1 of your remaining N turns."
 
-  C5. Interrupt system (spec §3, design/CLAUDE_frontend.md C5).
-      → InterruptPanel.tsx (base) + all 15 function-specific variants.
-      → InterruptFileRow.tsx + FileValidationBanner.tsx.
-      → Interrupt notification: SSE "interrupt_created" → toast → navigate.
-      → PipelineControlsSidebar.tsx with AutoCheckbox per pipeline function.
+  C5. Interrupt system (interactive_control_spec.md §4).
+      → InterruptPanel.tsx (base component) with 14 function-specific variants,
+        one per PipelineFunctionId value. See the full list in A2 / D5.
+      → Display label for each variant comes from pipelineLabels.ts, not from
+        the raw function_name string.
+      → Panel does NOT open as a modal overlay automatically. When SSE
+        interrupt_created fires and the user is NOT on the interrupt panel:
+          → Show a toast notification with a "Go to interrupt →" link.
+          → Increment a badge counter in the nav showing waiting interrupts.
+        When the user IS on /runs/:run_id/interrupts/:interrupt_id already:
+          → Refresh the panel data.
+        This matches interactive_control_spec.md §4.3 (no auto-modal).
+      → Add two routes: /runs/:run_id/interrupts (list) and
+        /runs/:run_id/interrupts/:interrupt_id (panel).
+      → File replacement workflow (two-step, per sse_contract.md and
+        interactive_control_spec.md §4.8):
+          1. User picks a file. Optional pre-flight:
+               POST /api/validate/file (multipart) → FileValidationResult.
+               Show FileValidationBanner with the result.
+          2. User confirms upload:
+               POST /api/runs/:run_id/interrupts/:interrupt_id/files (multipart)
+               → response.artifact_ref + response.validation.
+          3. User clicks Resume:
+               POST /api/runs/:run_id/interrupts/:interrupt_id/resume
+               Body: InterruptResumeRequest where modified_files[] carries
+               artifact_ref values returned from /files uploads. Sending
+               raw file bytes in the resume body is not supported.
+      → InterruptFileRow.tsx:
+          [View]:    fetch via GET /api/artifacts/:ref (302 redirect).
+          [Edit]:    open CodeMirror editor; on save → POST /files (step 2 above).
+          [Replace]: file input → POST /validate/file → POST /files.
+      → FileValidationBanner.tsx:
+          Props: validation: FileValidationResult
+          severity="error":   red banner; disables Resume button.
+          severity="warning": yellow banner; Resume allowed with confirmation.
+          severity="info":    blue banner; informational only.
+          Renders issues[] list below the summary message when present.
+      → AutoCheckbox.tsx:
+          Props: functionName: PipelineFunctionId, runId: string, checked: boolean
+          On toggle: PATCH /api/runs/:runId/auto-config
+          Body: AutoConfigPatch with one key (the PipelineFunctionId value, flat
+          snake_case). Never send dotted keys.
+          Optimistic update; revert on error.
+      → PipelineControlsSidebar.tsx:
+          Groups AutoCheckbox by phase prefix.
+          "Reset all to Auto" button sends AutoConfigPatch with all 14 keys
+          set to true.
 
 Step 6. Implement Phase D — Supporting Views.
 
@@ -755,25 +1130,52 @@ Step 6. Implement Phase D — Supporting Views.
   D4. Settings (/settings) — §8.
       → LLM API keys: write-only input, last-4 display only.
 
-  D5. Phase-end downloads (spec §4, design/CLAUDE_frontend.md D5).
+  D5. Phase-end downloads (interactive_control_spec.md §5).
       → PhaseDownloadButton.tsx + PhaseDownloadGroup.tsx.
       → EvidencePackageButton.tsx.
       → Download buttons on timeline event cards (Phase 1/2/3 completion).
       → "Download all Phase N" in Artifacts pane.
+      → On click: GET endpoint follows HTTP 302 to presigned URL.
+        Frontend does not stream bytes itself; the redirect is the download.
 
 Step 7. Implement Phase E — Auth, Error Handling, Polish.
 
-  E1. Login page + JWT token management + Registration.
-      → Role-based rendering (hide intervention controls for viewer).
-      → /register page: form + zxcvbn password meter + first-user admin banner.
-      → /settings/users page: admin-only, role management table.
+  E1. Login page + JWT token management + Registration page (/register).
+      → Role-based rendering: hide intervention controls for viewer role.
+      → /register page:
+          Form fields per RegisterRequest schema.
+          zxcvbn password strength meter: advisory display only.
+          The "Create account" button is always enabled — the server is the
+          authority on password strength (not the meter).
+          On 201 with role="admin": show "You are the first user — admin role
+          granted" banner.
+          On 400: render field-level errors from ApiError.detail.field.
+          Anti-enumeration: the UI cannot distinguish "email taken" from
+          "success" — display "If this email is new, you'll receive a
+          confirmation" regardless.
+      → /settings/users page: admin-only; role management table.
+        Role change takes effect on user's next login (or immediately on
+        downgrade per interactive_control_spec.md §3.3).
+
   E2. Error handling per spec §9.
-      → Red badge on spec row, persistent banner for systemic errors.
+      → All ApiError responses expose `.code` for programmatic branching.
+      → Red badge on spec row for spec-level errors.
+      → Persistent banner for systemic errors (run failed, etc.).
+      → ApiError.trace_id shown in developer/debug mode.
+
   E3. Skeleton UI, empty states, stale indicator (SSE disconnected).
+      → Show "⚠ Live updates paused" banner when EventSource.onerror fires.
+      → Clear banner when EventSource reconnects (onerror followed by a
+        successful message).
 
 Step 8. Build verification.
         → npm run build      (must succeed, zero TypeScript errors)
         → npm run lint       (zero ESLint errors)
+        → npx tsc --noEmit   (strict mode; confirms all shared contract
+                              types compile cleanly)
+        → Verify the exhaustive switch in useSSE.ts: add a temporary fake
+          kind to SSEMessageKind (in a local test file) and confirm that
+          TypeScript raises an error at the default: never branch.
 
 Step 9. Verify full stack in Docker.
         → docker compose up -d --build frontend
@@ -781,6 +1183,225 @@ Step 9. Verify full stack in Docker.
         → curl http://localhost:3000/api/health →  {"status": "ok"} (proxy works)
         → Open browser: http://localhost:3000
           Login page must render. Dashboard must load after login.
+          /register must render with password strength meter.
+
+Step 10. Run Standard Last Step.
+```
+
+---
+
+## Session 11 — Worker Implementation (Celery Tasks)
+
+**Trigger:** `Read CLAUDE.md and execute Session 11.`
+
+**Prerequisite:** Session 9 (Backend) must be complete.
+Verify: `curl http://localhost:8000/api/health` returns `{"status": "ok"}`.
+
+```
+Step 0. Read CLAUDE.md in full.
+        Read CLAUDE_Sessions_prompt.md in full.
+
+Step 1. Read spec/worker_spec.md in full.
+        Read design/CLAUDE_worker.md in full.
+        Read design/CLAUDE_backend.md §§ Gap 2–4 and Phase D.
+        Read design/CLAUDE_infra.md §§ File 1 (docker_runner.py) and
+          File 4 (Dockerfile.worker).
+        Read spec/interactive_control_spec.md §4 (interrupt gate contract).
+        Read spec/sse_contract.md §8 (event kinds and payload shapes).
+        Read shared/contracts/README.md (PipelineFunctionId enum values).
+        (CLAUDE_worker.md is the single implementation guide for this session.
+         CLAUDE_backend.md Phase D provides supplementary context only.
+         sse_contract.md is authoritative for all wire-level event details.)
+
+Step 2. Verify prerequisites.
+
+  2a. Schema completeness.
+      → All 14 shared types required by interactive_control_spec.md §12
+        must be present in shared/contracts/sailor.schema.json:
+          PipelineFunctionId, InterruptScope, InterruptStatus,
+          InterruptPoint, InterruptInputFile, InterruptResumeRequest,
+          InterruptSkipRequest, AutoConfig, AutoConfigPatch,
+          FileValidationResult, FileValidationSeverity,
+          InterruptCreatedPayload, InterruptResolvedPayload,
+          AutoConfigChangedPayload.
+      → If any are missing: run ./scripts/regen_contracts.sh first.
+        Do NOT proceed past Step 2 with incomplete shared types.
+
+  2b. Database models.
+      → Confirm ORM models exist in backend/models/:
+          interrupt_point.py  (InterruptPoint with status, input_files,
+                               option_overrides, modified_files columns)
+          auto_config.py      (AutoConfig JSONB per run_id)
+      → If missing: create them and generate + apply a migration before
+        writing any task code.
+      → Run: alembic upgrade head
+             pytest tests/ -v  (existing tests must still pass)
+
+  2c. Docker images.
+      → Verify docker/Dockerfile.runner builds:
+          docker build -f docker/Dockerfile.runner -t sailor-runner:latest .
+      → Verify docker/Dockerfile.worker builds:
+          docker build -f docker/Dockerfile.worker -t sailor-worker:latest .
+      → If either fails: fix the Dockerfile before continuing.
+
+Step 3. Implement Phase A — Shared Infrastructure.
+
+  A1. Lease management additions to services/spec_service.py.
+      → acquire_phase2_lease(), extend_lease(), drop_lease(), persist_turn()
+      → All use optimistic locking (UPDATE ... WHERE ... RETURNING id).
+      → Zero-row result = lease lost; caller raises CooperativeExit.
+
+  A2. backend/tasks/_control.py
+      → CooperativeExit exception class.
+      → check_control_flags(session, spec_id, run_id, worker_id, event_service).
+        Order: cancel → paused → intervention (process list in order).
+      → apply_intervention() dispatcher for all three intervention types.
+
+  A3. backend/tasks/_interrupt.py
+      → interrupt_gate(session, function_id, run_id, spec_id, worker_id,
+                       event_service, scope, input_files) → dict.
+      → Creates InterruptPoint row, publishes interrupt_created SSE.
+      → Polls every 2s; calls check_control_flags() in each iteration.
+      → Extends lease every 60s while waiting.
+      → Returns option_overrides and modified_file_refs on "resumed".
+      → Returns {skipped: True} on "skipped".
+
+  A4. run_counters_updated throttle in services/event_service.py.
+      → publish_counters_throttled(run_id, counters): max 1 publish/second.
+      → Deferred flush if suppressed (asyncio.call_later or asyncio.Task).
+
+  After A1–A4: pytest tests/test_tasks.py::test_interrupt_gate_* -v
+
+Step 4. Implement Phase B — phase1_task.
+
+  B1. backend/tasks/phase1.py
+      → Celery task with queue="phase1", acks_late=True,
+        reject_on_worker_lost=True.
+      → Idempotency guard: run.status != "queued" → return early.
+      → DockerRunner(cve_id=run_id, config=RunnerConfig()).
+      → 4 interrupt gates (phase1_codeql_build, phase1_codeql_analyze,
+        phase1_fact_enrichment, phase1_spec_generation).
+      → Default outputs on "skipped" per CLAUDE_worker.md §Gap W7 table.
+      → Spec ID: deterministic SHA-256(run_id + rule_id + file + line)[:32].
+      → INSERT spec ON CONFLICT DO NOTHING (idempotency).
+      → Publish: RunStarted → SpecEmitted/SpecFiltered per finding →
+        run_counters_updated (throttled) → enqueue phase2_task per spec.
+      → Failure: codeql_build_failure → run.status=failed, RunFailed SSE.
+      → runner.stop() in finally block (NON-NEGOTIABLE).
+
+  After B1: pytest tests/test_tasks.py::test_phase1_* -v
+
+Step 5. Implement Phase C — phase2_task.
+
+  C1. backend/tasks/phase2.py — implement in this order:
+      C1a. Lease acquisition + heartbeat loop (asyncio.Task, every 30s).
+      C1b. State rehydration from last Turn row.
+      C1c. Algorithm 1 main loop (T_max / T_explore / T_author budgets).
+      C1d. Interrupt gates: phase2_source_exploration, phase2_driver_synthesis,
+           phase2_stub_synthesis, phase2_klee_execution,
+           phase2_harness_refinement.
+      C1e. Turn persistence (atomic: Spec update + Turn insert in one txn).
+      C1f. Intervention application for all three types.
+
+  LLM retry: exponential backoff, base 2s, max 5 attempts, cap 60s.
+             Gemini 429 follows the same path (see CLAUDE_backend.md Gap 3).
+             After 5 failures: spec.phase2_status = "errored".
+
+  Celery config: soft_time_limit=18_000, time_limit=18_060.
+
+  After C1: pytest tests/test_tasks.py::test_phase2_* -v
+
+Step 6. Implement Phase D — phase3_task.
+
+  D1. backend/tasks/phase3.py
+      → Lease acquisition (same pattern as Phase 2, for phase3_status).
+      → 2 interrupt gates: phase3_asan_build, phase3_replay_execution.
+      → Load Phase 2 artifacts: driver.c, slice.c, witness .ktest.
+      → runner.build_asan_archive() → asan failure → errored.
+      → ReplayDriverGenerator().generate() → replace klee_make_symbolic
+        with memcpy of witness bytes.
+      → runner.compile_harness() → compile failure → errored.
+      → runner.run_asan_replay() → ResultClassifier().classify().
+      → Write: asan_report.txt, replay_driver.c, verified_bug.json
+        to artifact store.
+      → Verdict row: dedup_key = SHA-256(file + func + line)[:32].
+      → Update run.counters (unique_confirmed deduplicated by dedup_key).
+      → Call _check_run_completion(): if all specs terminal →
+        run.status=completed, publish RunCompleted SSE.
+      → runner.stop() in finally block.
+
+  After D1: pytest tests/test_tasks.py::test_phase3_* -v
+
+Step 7. Implement Phase E — Logging and Container Streaming.
+
+  E1. Log publication for long-running container steps.
+      → _stream_and_log(): background asyncio.Task reading docker logs
+        line-by-line during KLEE runs and ASan builds.
+      → Each line: write LogLine to DB + publish log_line SSE.
+      → Source tags: "klee" for KLEE, "clang" for compile, "asan" for ASan.
+      → All worker log.info/warning/error calls also write to DB via
+        a custom logging handler.
+
+  E2. Worker heartbeat (idle state).
+      → When no spec is leased: publish WorkerHeartbeat every 5s.
+      → Status="idle", current_spec_id=null.
+
+Step 8. Implement Phase F — Tests.
+
+  F1. tests/test_tasks.py
+      → Full test matrix per CLAUDE_worker.md Phase F.
+      → Mock DockerRunner and sailor/ calls via unittest.mock.patch.
+      → Use pytest-asyncio + in-memory PostgreSQL (or test DB from conftest).
+      → Every test runs in an isolated DB transaction (rollback on teardown).
+
+  F2. Run full test suite.
+      → pytest tests/ -v         (all backend + task tests)
+      → mypy backend/tasks/ backend/services/ --strict
+
+Step 9. Verify full stack in Docker.
+
+  9a. Build and start all services.
+      → docker compose up -d --build worker
+      → docker compose logs worker --tail=20  (must show "celery ready")
+
+  9b. Submit a test run using the e2e workspace target.
+      → curl -X POST http://localhost:8000/api/runs \
+             -F "name=cwe_122_test" \
+             -F "project_zip=@tests/e2e_workspace/cwe_122/target.c" \
+             -H "Authorization: Bearer <token>"
+      → curl http://localhost:8000/api/runs/<run_id>
+        Watch for status progression: queued → running → completed.
+
+  9c. Verify SSE event stream.
+      → curl -N "http://localhost:8000/api/events?topics=runs.<run_id>&token=<jwt>"
+        Events must appear (not silence). Expected kinds in order:
+          run_status_changed (running)
+          spec_state_changed (emitted) × N
+          run_counters_updated
+          turn_appended × per spec per turn
+          spec_state_changed (terminal) × N
+          run_status_changed (completed)
+
+  9d. Verify interrupt functionality.
+      This is NOT judged by clicks alone. All checks must be confirmed
+      in the backend state store (database), not only in the SSE stream.
+      → PATCH /api/runs/<run_id>/auto-config
+               {"phase2_klee_execution": false}
+      → Confirm interrupt_points row written with status="waiting".
+      → Confirm interrupt_created SSE event received.
+      → POST /api/runs/<run_id>/interrupts/<id>/skip
+      → Confirm interrupt_points row updated to status="skipped".
+      → Confirm interrupt_resolved SSE event received.
+      → Confirm spec resumes processing (turn_count_total increments in DB).
+
+  9e. Verify pause/resume/cancel propagate to workers.
+      → POST /api/runs/<run_id>/pause while run is in progress.
+      → Confirm: run.status=paused in DB within 1 turn cycle.
+      → Confirm: in-progress spec phase2_status=queued in DB.
+      → POST /api/runs/<run_id>/resume.
+      → Confirm: spec re-queued and processing resumes.
+      → POST /api/runs/<run_id>/cancel.
+      → Confirm: run.status=cancelled; specs not yet started → errored.
 
 Step 10. Run Standard Last Step.
 ```

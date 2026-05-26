@@ -79,8 +79,12 @@ CodeQL build mode      autodetect / build-mode=none / custom command
 Phase 1 query suite    multi-select from the 34-query catalog
                        (default: all 34; per-CWE toggles available)
 
-Phase 2 budgets        T_explore, T_author, T_max, T_klee, R_max
+Phase 2 budgets        phase2_t_explore, phase2_t_author, phase2_t_max,
+                       phase2_t_klee_seconds, phase2_r_max
                        (defaults: 8 / 12 / 60 / 300s / 15)
+                       UI labels may abbreviate (e.g. "T_max"); wire format
+                       uses the snake_case names. See RunConfig in
+                       shared/contracts/sailor.schema.json.
 
 Phase 2 parallelism    integer (default 128, capped to worker pool size)
 

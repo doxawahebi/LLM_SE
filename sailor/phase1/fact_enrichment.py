@@ -22,7 +22,7 @@ from pathlib import Path
 import tree_sitter_c as tsc
 from tree_sitter import Language, Parser
 
-from models.schemas import BuildContext, FactPack, SARIFFinding
+from sailor.models.schemas import BuildContext, FactPack, SARIFFinding
 
 logger = logging.getLogger("sailor.phase1.fact_enrichment")
 
@@ -36,6 +36,8 @@ DANGEROUS_FUNCTIONS: frozenset[str] = frozenset({
     "sprintf", "snprintf", "malloc", "calloc", "realloc",
     "free", "bfd_zalloc", "bfd_alloc", "alloca",
     "xmalloc", "xrealloc", "g_malloc", "g_realloc",
+    # tcpdump unaligned-read macros — each reads N bytes past a pointer
+    "EXTRACT_8BITS", "EXTRACT_16BITS", "EXTRACT_32BITS", "EXTRACT_64BITS",
 })
 
 _RE_CALL        = re.compile(r"\b([a-zA-Z_]\w*)\s*\(")

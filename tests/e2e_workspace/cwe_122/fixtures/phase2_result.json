@@ -1,0 +1,22 @@
+{
+  "spec_id": "local/cpp/cwe-120-overflow:/home/cks/Project/SE-LLM-project/tests/e2e_workspace/cwe_122/target.c:6",
+  "outcome": "bug_triggered",
+  "witness": {
+    "spec_id": "local/cpp/cwe-120-overflow:/home/cks/Project/SE-LLM-project/tests/e2e_workspace/cwe_122/target.c:6",
+    "ktest_paths": [
+      "tests/e2e_workspace/cwe_122/fixtures/witness.ktest"
+    ],
+    "outcome": "bug_triggered",
+    "harness": {
+      "driver_c": "#include <klee/klee.h>\n#include <stdlib.h>\n#include <string.h>\n\n/* Forward declaration of the vulnerable function defined in slice */\nvoid vulnerable(unsigned char *dst, size_t dst_size,\n                unsigned char *src, size_t src_size);\n\nint main(void) {\n    size_t dst_size;\n    size_t src_size;\n\n    klee_make_symbolic(&dst_size, sizeof(dst_size), \"dst_size\");\n    klee_make_symbolic(&src_size, sizeof(src_size), \"src_size\");\n\n    /* Keep sizes bounded to avoid state explosion */\n    klee_assume(dst_size >= 1 && dst_size <= 64);\n    klee_assume(src_size >= 1 && src_size <= 128);\n\n    /* Trigger condition: src_size > dst_size causes heap overflow */\n    klee_assume(src_size > dst_size);\n\n    unsigned char *dst = calloc(dst_size, 1);\n    unsigned char *src = calloc(src_size, 1);\n\n    if (!dst || !src) return 1;\n\n    /* Make source buffer contents symbolic */\n    klee_make_symbolic(src, src_size, \"src_data\");\n\n    /* Call vulnerable: memcpy will write src_size bytes into dst_size buffer */\n    vulnerable(dst, dst_size, src, src_size);\n\n    free(dst);\n    free(src);\n    return 0;\n}",
+      "slice_c": "#include <stdlib.h>\n#include <string.h>\n#include <klee/klee.h>\n\n/* ------------------------------------------------------------------ */\n/* SPINE_PROBE macro: marks function entry for coverage tracking       */\n/* ------------------------------------------------------------------ */\n#define SPINE_PROBE(name) klee_assert(1 && name)\n\n/* ------------------------------------------------------------------ */\n/* Vulnerable function with sink assertion                             */\n/* ------------------------------------------------------------------ */\nvoid vulnerable(unsigned char *dst, size_t dst_size,\n                unsigned char *src, size_t src_size) {\n    SPINE_PROBE(\"vulnerable\");\n\n    /* Branch stub: no bounds check \u2014 this is the bug */\n    /* Loop stub: no loop in this function */\n\n    /* CWE-120/CWE-122 sink:\n     * memcpy called with src_size not bounded by dst_size.\n     * When src_size > dst_size, dst heap buffer is overflowed. */\n    memcpy(dst, src, src_size);   /* \u2190 \u2113  line 6 */\n\n    /* Sink reached: trigger KLEE assertion error */\n    klee_assert(0 && \"SAILOR_SINK_REACHED\");\n}",
+      "compile_cmd": "clang-14 -O0 -g -emit-llvm -c -Xclang -disable-O0-optnone /tmp/pytest-of-cks/pytest-15/test_phase2_triggers_bug_cwe_10/phase2/vulnerable/harness/driver.c -o /tmp/pytest-of-cks/pytest-15/test_phase2_triggers_bug_cwe_10/phase2/vulnerable/harness/driver.bc",
+      "link_cmd": "llvm-link-14 /tmp/pytest-of-cks/pytest-15/test_phase2_triggers_bug_cwe_10/phase2/vulnerable/harness/driver.bc /tmp/pytest-of-cks/pytest-15/test_phase2_triggers_bug_cwe_10/phase2/vulnerable/harness/slice.bc -o /tmp/pytest-of-cks/pytest-15/test_phase2_triggers_bug_cwe_10/phase2/vulnerable/harness/harness.bc",
+      "bitcode_path": "/tmp/pytest-of-cks/pytest-15/test_phase2_triggers_bug_cwe_10/phase2/vulnerable/harness/harness.bc"
+    },
+    "turns_used": 14,
+    "refine_count": 0
+  },
+  "turns_used": 14,
+  "timestamp": "2026-05-23T17:52:47Z"
+}
