@@ -1,17 +1,27 @@
 import { create } from "zustand";
 import type { Spec } from "@/lib/types";
-import { applyMergePatch } from "@/lib/jsonPatch";
 
 interface SpecStore {
   specs: Map<string, Spec>;
-  setSpec: (spec: Spec) => void;
+
+  // Full-replace (snapshot semantics per sse_contract §5.3)
+  upsert: (spec: Spec) => void;
+  setSpec: (spec: Spec) => void;  // alias for compat
   setSpecs: (specs: Spec[]) => void;
-  applyDiff: (id: string, patch: Partial<Spec>) => void;
+  clearForRun: (run_id: string) => void;
   clearSpecs: () => void;
 }
 
 export const useSpecStore = create<SpecStore>((set) => ({
   specs: new Map(),
+
+  upsert: (spec) =>
+    set((s) => {
+      const next = new Map(s.specs);
+      const key = spec.id;
+      next.set(key, spec);
+      return { specs: next };
+    }),
 
   setSpec: (spec) =>
     set((s) => {
@@ -29,12 +39,12 @@ export const useSpecStore = create<SpecStore>((set) => ({
       return { specs: next };
     }),
 
-  applyDiff: (id, patch) =>
+  clearForRun: (run_id) =>
     set((s) => {
-      const existing = s.specs.get(id);
-      if (!existing) return {};
       const next = new Map(s.specs);
-      next.set(id, applyMergePatch(existing, patch));
+      for (const [key, spec] of next) {
+        if (spec.run_id === run_id) next.delete(key);
+      }
       return { specs: next };
     }),
 

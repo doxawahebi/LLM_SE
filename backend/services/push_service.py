@@ -79,22 +79,47 @@ class PushService:
                 pending.clear()
                 last_flush = now
 
+    @staticmethod
+    def _topic_matches(published: str, subscribed: str) -> bool:
+        """Return True if a message published on `published` should reach a `subscribed` topic.
+
+        runs.all is a global wildcard — it receives every message on any runs.* topic.
+        Otherwise: exact match, or published is a sub-topic of subscribed (prefix + ".").
+        """
+        if subscribed == "runs.all":
+            return published.startswith("runs.")
+        return published == subscribed or published.startswith(subscribed + ".")
+
     def _fan_out(self, topic: str, messages: list[str]) -> None:
         if not messages:
             return
-        # Coalesce counter_diffs — keep only the latest
+        # Coalesce run_counters_updated — keep only the latest per run
         parsed = [json.loads(m) for m in messages]
-        counter_msgs = [m for m in parsed if m.get("kind") == "counter_diff"]
-        non_counter = [m for m in parsed if m.get("kind") != "counter_diff"]
+        counter_msgs = [m for m in parsed if m.get("kind") == "run_counters_updated"]
+        non_counter = [m for m in parsed if m.get("kind") != "run_counters_updated"]
         if counter_msgs:
             non_counter.append(counter_msgs[-1])
 
-        payload = json.dumps(non_counter)
+        # Format each message as an SSE frame
+        frames = []
+        for msg in non_counter:
+            msg_str = json.dumps(msg, separators=(",", ":"))
+            seq = msg.get("sequence", 0)
+            kind = msg.get("kind", "message")
+            if kind == "resync_required":
+                # resync_required is never batched — send immediately as single frame
+                frames.append(f"id: {seq}\nevent: {kind}\ndata: {msg_str}\n\n")
+            else:
+                frames.append(msg_str)  # raw JSON for batching below
+
+        # For now, send each as individual SSE frames (batching window is in event_generator)
         dead = []
         for conn in self._connections:
-            if topic in conn.topics or any(topic.startswith(t) for t in conn.topics):
-                if not conn.enqueue(payload):
-                    dead.append(conn)
+            if any(self._topic_matches(topic, t) for t in conn.topics):
+                for frame in frames:
+                    if not conn.enqueue(frame):
+                        dead.append(conn)
+                        break
         for conn in dead:
             logger.warning("Dropping SSE connection (buffer exceeded)")
             if conn in self._connections:

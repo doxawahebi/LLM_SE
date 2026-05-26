@@ -591,7 +591,6 @@ import cpp
 from ReturnStmt ret, AddressOfExpr addr, LocalVariable lv
 where ret.getExpr() = addr
   and addr.getOperand() = lv.getAnAccess()
-  and lv.isLocal()
   and not lv.isStatic()
 select ret,
   "CWE-416/562: Return of address of stack-local variable '" + lv.getName() +
@@ -616,7 +615,6 @@ import cpp
 from AssignExpr ae, AddressOfExpr addr, LocalVariable lv, FieldAccess fa
 where ae.getRValue() = addr
   and addr.getOperand() = lv.getAnAccess()
-  and lv.isLocal()
   and not lv.isStatic()
   and ae.getLValue() = fa
 select ae,

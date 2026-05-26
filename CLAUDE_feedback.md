@@ -478,3 +478,158 @@ Source of truth: `spec/interactive_control_spec.md` (new file)
 - `POST /api/runs/{id}/rerun-failed` endpoint missing in backend (`api/runs.py`) — `RunHeader.tsx` "Re-run failed" button will get 404. Not a blocker for the reported bugs.
 - `Run.project_ref` in `lib/types.ts` doesn't match backend `project_zip_ref` — any code using `run.project_ref` gets `undefined`. Not currently used in visible components.
 - New users default to `viewer` role and cannot create runs (403). Operator role must be granted by admin via `/settings/users`.
+
+---
+
+## [Session 9] 2026-05-25T14:00:00Z
+
+### Files modified in backend/
+
+- `backend/models/interrupt_point.py`: Removed `phase` column (derivable from function_name prefix); added `scope` (run|spec), `resolved_at`, `resolved_by`, `input_files`, `resume_files`, `resume_overrides`, `uploaded_artifact_refs`.
+- `backend/models/auto_config.py`: Replaced `DEFAULT_AUTO_CONFIG` with dotted keys with `VALID_FUNCTION_IDS` frozenset of 14 flat snake_case PipelineFunctionIds. Column default now `{}` (empty = all auto=true).
+- `backend/migrations/versions/0003_fix_interrupt_schema.py`: NEW — removes `phase`/`modified_files`, adds `scope`, `resolved_at`, `resolved_by`, `input_files`, `resume_files`, `resume_overrides`, `uploaded_artifact_refs`; resets auto_config to `{}`.
+- `backend/services/validation_service.py`: Returns `FileValidationResult` from shared contracts (keyword args); added replay_driver.c klee_* call detection (rule="replay_driver.klee_call_present"); added helper functions `_ok`/`_err`/`_warn`.
+- `backend/services/event_service.py`: New `publish_message(msg: BaseModel)` method using Redis INCR for sequence and ZADD for sorted-set replay buffer; renamed kind "run_counters_updated" (was "counter_diff"); added `get_current_seq()`.
+- `backend/services/push_service.py`: Fixed coalescing to check for `"run_counters_updated"` kind.
+- `backend/api/auto_config.py`: Uses `AutoConfigPatch`/`AutoConfig` from shared contracts; PATCH rejects dotted keys (422 code="invalid_function_name"); publishes `SSEMessageAutoConfigChanged`.
+- `backend/api/validate.py`: Changed from JSON-body to multipart form-data (`UploadFile` + `filename: Form`); returns `FileValidationResult` from shared contracts.
+- `backend/api/interrupts.py`: Major rewrite — removed `phase` field from schema conversion; added `POST /files` endpoint (upload → artifact_ref); `InterruptResumeRequest` uses artifact_refs from prior uploads only; `apply_to_all_matching` with files → 422; re-validates files before applying; handles `re_enable_auto`; publishes `SSEMessageInterruptResolved`; fixed naive datetime for DB writes.
+- `backend/api/events.py`: Proper SSE wire format (`id: {seq}\nevent: {kind}\ndata: {json}\n\n`); `ApiError` JSON on auth failure; topic regex + max 32 + `runs.all` access control; sorted-set replay on reconnect; 15s keep-alive comments.
+- `backend/api/auth.py`: `RegisterRequest`/`RegisterResponse` now imported from `shared.contracts.sailor_models`.
+- `backend/config.py`: Added `extra = "ignore"` to handle extra vars in .env file.
+- `backend/requirements.txt`: Added `email-validator>=2.0.0`.
+- `backend/Dockerfile`: Changed build context to project root; added `COPY shared/ ./shared/` so shared contracts are available.
+- `docker-compose.yml`: Updated backend build context from `./backend` to `.` with `dockerfile: backend/Dockerfile`.
+- `shared/__init__.py`, `shared/contracts/__init__.py`: Created to make shared a Python package.
+- `backend/tests/test_interrupts.py`: Completely rewritten — uses flat snake_case function_name, `scope` field, two-step file upload flow, multipart validation endpoints, updated passwords (≥12 chars).
+
+### Spec files verified accurate
+- [ok] `spec/interactive_control_spec.md`: InterruptPoint schema (scope, function_name, no phase) — matches code
+- [ok] `spec/backend_spec.md` §interrupt flow: two-step /files → /resume with artifact_ref — matches code
+- [ok] `spec/sse_contract.md` §2.2: SSE wire format id/event/data — matches events.py
+
+### Spec files that need update
+- None identified.
+
+### Code fixes applied (Case A — code was wrong, spec was correct)
+- `interrupt_point.py`: had `phase` column (spec says derivable from function_name)
+- `auto_config.py`: had dotted keys like "phase1.db_build" (spec requires snake_case "phase1_db_build")
+- `validate.py`: used JSON body (spec requires multipart/form-data)
+- `events.py`: SSE frames missing `id:` and `event:` lines (sse_contract.md §2.2)
+- `event_service.py`: used LPUSH replay buffer (spec requires sorted set ZADD); wrong kind name "counter_diff"
+- `interrupts.py`: resume embedded files inline (spec requires separate /files upload step)
+- `auth.py`: defined local RegisterRequest instead of importing from shared contracts
+
+### Verification
+- `pytest backend/tests/ -v` → 34/34 passed ✓
+- `curl http://localhost:8000/api/health` → `{"status":"ok","components":{...all ok...}}` ✓
+
+---
+
+## [Session 10 — continuation] 2026-05-25T14:35:00Z
+
+### Root causes fixed (TypeScript build was failing)
+
+Session resumed after context compaction. `npm run build` had 3 TypeScript errors and 5 ESLint
+errors. This continuation resolved all of them.
+
+**ESLint errors (resolved prior session, recorded here for completeness)**:
+- `ErrorToast.tsx` exported `showError`/`showWarning` (non-component functions) alongside a
+  component — violates `react-refresh/only-export-components`. Fix: moved both functions to
+  `src/lib/toast.ts`; `ErrorToast.tsx` now only exports `ErrorToastContainer`.
+- `useSSE.ts` updated ref `.current` during render — violates `react-hooks/exhaustive-deps`.
+  Fix: wrapped in `useLayoutEffect`.
+
+**TypeScript errors (resolved this session)**:
+- `RunDetail/index.tsx` and `SpecDetail/index.tsx` imported `InterruptNotification` type and
+  passed `onInterrupt` callback to `useSSE` — but the rewritten `useSSE` removed both (interrupts
+  now go directly to `useInterruptStore`). Fix: removed `onInterrupt`/`InterruptNotification`,
+  replaced with store-watching via `useEffect` + seen-ID ref (toast only for new interrupts);
+  `SpecDetail` watches store to trigger `refetchInterrupts()` when interrupt count changes.
+- `useSSE.ts` imported unused `Run` type. Fix: removed from import.
+
+### Files modified in frontend/
+
+- `frontend/src/lib/toast.ts`: NEW — `showError`/`showWarning` + `toastListeners` event bus.
+- `frontend/src/components/ErrorToast.tsx`: removed non-component exports; imports from `@/lib/toast`.
+- `frontend/src/api/client.ts`: `showError` import updated to `@/lib/toast`.
+- `frontend/src/lib/pipelineLabels.ts`: NEW — `pipelineLabels` map for all 14 PipelineFunctionIds.
+- `frontend/src/lib/ui-types.ts`: NEW — `FilterPreset`, `SpecFilters`, `ToastSeverity` types.
+- `frontend/src/hooks/useInterruptStore.ts`: NEW — Zustand store for `InterruptPoint` entities.
+- `frontend/src/hooks/useSSE.ts`: REWRITTEN — exhaustive switch on 11 SSE message kinds;
+  `useLayoutEffect` for ref updates; `onInterrupt` removed; `Run` import removed.
+- `frontend/src/hooks/useRunStore.ts`: added `autoConfigs` map + `setStatus`/`setCounters`/`setAutoConfig`.
+- `frontend/src/hooks/useSpecStore.ts`: added `upsert` + `clearForRun`.
+- `frontend/src/pages/InterruptList.tsx`: NEW — `/runs/:run_id/interrupts` page.
+- `frontend/src/pages/InterruptDetail.tsx`: NEW — `/runs/:run_id/interrupts/:interrupt_id` page.
+- `frontend/src/pages/RunDetail/index.tsx`: replaced `onInterrupt`/`InterruptNotification` with
+  store-watch via `useEffect` + `seenInterruptIds` ref.
+- `frontend/src/pages/SpecDetail/index.tsx`: replaced `onInterrupt`/`InterruptNotification` with
+  store-watch via `useEffect` + `prevCountRef`.
+- `frontend/src/App.tsx`: added `/runs/:run_id/interrupts` and `/runs/:run_id/interrupts/:interrupt_id` routes.
+- `frontend/Dockerfile`: build context changed from `./frontend` to project root (`.`); copies
+  `shared/` adjacent to `frontend/` so `../shared/contracts/` resolves correctly.
+- `docker-compose.yml`: `frontend.build.context` changed from `./frontend` to `.`;
+  `dockerfile` set to `frontend/Dockerfile`.
+
+### Build verification
+
+- `npm run build` → 0 TypeScript errors ✓ (854 modules, 697ms)
+- `npm run lint` → 0 ESLint errors ✓
+- `docker compose build frontend` → succeeds ✓ (multi-stage, shared/contracts included)
+
+---
+
+## [Session 11] 2026-05-26T00:00:00Z
+
+### Files created in backend/
+
+- `backend/tasks/_control.py`: NEW — `CooperativeExit` exception; `check_control_flags()` (order: cancel→pause→intervention); `apply_intervention()` dispatcher for EditHarness, ForceOutcome, EditSpec.
+- `backend/tasks/_interrupt.py`: NEW — `interrupt_gate()` implementing interactive_control_spec.md §4.3; reads AutoConfig; manual mode creates `InterruptPoint`, polls every 2s, extends lease every 60s, propagates `CooperativeExit` from `check_control_flags()`.
+- `backend/tests/test_tasks.py`: NEW — 20 tests covering interrupt gate (auto/manual/skip/resume/cancel), control flags, phase1 (idempotency/no-zip/spec-gen), phase2 (lease/pause/cancel/intervention/budget), phase3 (confirmed/rejected/build-fail/run-completion), counter throttle.
+
+### Files rewritten in backend/
+
+- `backend/tasks/phase1.py`: Full rewrite — 5 interrupt gates (phase1_db_build, phase1_query_execution, phase1_sarif_parsing, phase1_fact_enrichment, phase1_spec_generation); idempotency guard; deterministic spec_id (SHA-256); SSE publishing; dispatches `phase2_task.delay(spec_id)`.
+- `backend/tasks/phase2.py`: Full rewrite — Algorithm 1 main loop (T_explore=8, T_author=12, T_max=60, R_max=15); 6 interrupt gates; `_heartbeat_loop` background task; LLM retry (exponential backoff, 5 attempts); `persist_turn` atomic commit; `_set_spec_terminal`; `runner.stop()` in `finally`.
+- `backend/tasks/phase3.py`: Full rewrite — 3 interrupt gates (phase3_replay_driver_generation, phase3_asan_compilation, phase3_result_classification); `_build_verdict_dict` (ASan regex → CWE mapping); `_persist_verdict_and_update`; `_check_run_completion`.
+
+### Files modified in backend/
+
+- `backend/services/spec_service.py`: Added `extend_lease_bool()` (returns False if lease stolen via RETURNING), `acquire_phase3_lease()`, `drop_phase3_lease()`, `persist_turn()` (atomic Spec UPDATE + Turn INSERT ON CONFLICT DO NOTHING).
+- `backend/services/event_service.py`: Added `publish_counters_throttled()` (≤1/s per run, asyncio deferred flush), `_do_publish_counters()`, `publish_run_status_changed()`, `publish_spec_state_changed()`, `publish_turn_appended()`, `publish_worker_heartbeat()`, `publish_log_line()`; fixed `_do_publish_counters` to fill `RunCounters` with zero defaults for missing fields.
+- `backend/tests/test_tasks.py`: Added `reset_db_pool` autouse fixture (disposes module-level asyncpg pool between tests to prevent cross-test event loop contamination).
+
+### Bugs fixed during implementation
+
+- [x] `tasks/_interrupt.py`: `session=None` passed by callers but function called `session.scalar()` directly → refactored to always use own `_get_new_session()` sessions.
+- [x] `services/event_service.py`: `RunCounters(**partial_dict)` raised `ValidationError` (all fields required, no defaults) inside `try/except` → silently dropped all counter publishes. Fix: fill defaults with `{k: 0 for k in RunCounters.model_fields}` before passing partial dict.
+- [x] `tests/test_tasks.py`: asyncpg connection pool shared across tests with session-scoped event loop caused "Future attached to different loop" errors when tests run together. Fix: `reset_db_pool` autouse fixture calls `database.engine.dispose()` after each test.
+
+### Spec files verified accurate
+
+- [ok] `spec/interactive_control_spec.md §4.3`: interrupt gate pattern — matches `tasks/_interrupt.py`.
+- [ok] `shared/contracts/sailor.schema.json`: 14 PipelineFunctionId values (authoritative) — used throughout all task files.
+- [ok] `design/CLAUDE_backend.md`: CooperativeExit exception pattern — matches `tasks/_control.py`.
+
+### Spec files that need update
+
+- None identified.
+
+### Code that needs fix (Case A) — fixed this session
+
+- None beyond the bugs noted above.
+
+### Known limitations
+
+- Phase E (container log streaming): not implemented. Worker-side `_stream_and_log()` background task reading Docker logs line-by-line during KLEE/ASan builds was deferred. LogLine SSE events are not published during container runs.
+
+### Test results
+
+- `backend/tests/` — **54/54 PASSED** ✓
+  - `test_tasks.py`: 20 PASSED ✓ (new — all worker/interrupt gate tests)
+  - `test_interrupts.py`: 18 PASSED ✓ (no regression)
+  - `test_interventions.py`: 2 PASSED ✓
+  - `test_phase_downloads.py`: 7 PASSED ✓
+  - `test_runs.py`: 4 PASSED ✓
+  - `test_specs.py`: 3 PASSED ✓

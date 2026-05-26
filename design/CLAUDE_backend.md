@@ -4,6 +4,9 @@
 > Stack: FastAPI + Celery + Redis + PostgreSQL + MinIO (S3-compatible).
 > All Absolute Rules in CLAUDE.md apply.
 > sailor/ pipeline package is imported here — do not re-implement it.
+>
+> Session 9  — Backend Implementation (FastAPI + Celery) — this file
+> Session 11 — Worker Implementation (Celery Tasks) — see design/CLAUDE_worker.md
 
 ---
 
@@ -71,11 +74,30 @@ model that lacks these fields).
 Tables (full list — same as before):
 
   runs, specs, turns, verdicts, audit_events, users, settings,
-  log_lines, idempotency_keys, export_jobs, interventions
+  log_lines, idempotency_keys, export_jobs, interventions,
+  interrupt_points, auto_config
 
-(The interrupt-related tables — `interrupt_points`, `auto_config` — are
-deferred until the interrupt contract is defined in the schema. See the
-contracts README "What is NOT in this schema (yet)".)
+interrupt_points columns (ORM model: backend/models/interrupt_point.py):
+  id               string, deterministic from (run_id, spec_id, function_name, "interrupt")
+  run_id           string FK → runs
+  spec_id          string FK → specs | null (Phase 1 gates have no spec)
+  function_name    PipelineFunctionId string (from shared/contracts)
+  scope            string "run" | "spec"
+  status           string "waiting" | "resumed" | "skipped"
+  resolved_by      string "user" | "system" | null
+  input_files      JSONB list[{name, artifact_ref, mime_type}]
+  modified_files   JSONB list[{name, artifact_ref}] | null
+  option_overrides JSONB dict | null
+  created_at       timestamp
+  resolved_at      timestamp | null
+
+auto_config columns (ORM model: backend/models/auto_config.py):
+  run_id           string PK FK → runs
+  config           JSONB: {PipelineFunctionId: bool}
+  updated_at       timestamp
+
+Default auto_config for a new run: all 11 PipelineFunctionId keys = true.
+Created automatically when a run is created (POST /api/runs).
 
 Indexes: unchanged from the existing list.
 
@@ -142,6 +164,17 @@ Task routing:
 
 Soft timeout: T_max × T_klee = 60 × 300 = 18,000s per phase2_task
 Hard timeout: soft + 60s
+
+Celery task config for phase2_task:
+  acks_late=True             (re-deliver if worker dies mid-task)
+  reject_on_worker_lost=True (ensure re-delivery, not silently dropped)
+  max_retries=3              (worker-crash retries only; not LLM retries)
+  soft_time_limit=18_000
+  time_limit=18_060
+
+Same acks_late + reject_on_worker_lost config applies to phase1_task and
+phase3_task (their timeouts are shorter but the reliability guarantee is
+the same).
 ```
 
 ### Gap 5: SSE Implementation Details (not specified)
@@ -657,6 +690,13 @@ contracts README for the table.
 Phase D — Celery Tasks
 
   Step D1. phase1_task (tasks/phase1.py).
+           Worker identity:
+             worker_id is generated once at task-module import time:
+               import os; from uuid import uuid4
+               WORKER_ID = f"{os.environ.get('HOSTNAME','worker')}-{os.getpid()}-{uuid4().hex[:8]}"
+             This string is written to specs.worker_id during lease acquisition
+             and cleared on lease drop. It is included in all WorkerHeartbeat
+             SSE events and in log_line rows.
            → Input: run_id
            → Use DockerRunner to execute Phase 1 inside container.
            → Call Phase1Pipeline with prebuilt_sarif=False (full run).
@@ -668,6 +708,14 @@ Phase D — Celery Tasks
            → Input: spec_id, continue_from_intervention=False
            → Lease acquisition per §9.2.
            → Lease heartbeat every 30s.
+           → Heartbeat runs as a background asyncio.Task created at the
+             start of _phase2() and cancelled in the finally block.
+           → On extend_lease failure (zero rows → lease stolen):
+             set a stop flag; the main loop observes it and exits.
+           → Idle heartbeat (no spec leased): separate 5s interval loop,
+             publishes WorkerHeartbeat with status="idle".
+             This loop runs for the entire lifetime of the Celery worker
+             process, not just during task execution.
            → Control-flag check at every turn boundary per §7.2:
                1. Check run.status (paused → requeue, cancelled → errored)
                2. Check intervention_pending → apply per §6
@@ -698,18 +746,25 @@ Phase D — Celery Tasks
       1. Write interrupt_points row with status="waiting"
       2. Publish SSE event: {kind: "interrupt_created",
                              interrupt_id, run_id, spec_id, function_name}
-      3. Pause task (poll interrupt_points row every 5s)
+      3. Pause task (poll interrupt_points row every 2s;
+                     extend lease every 60s while waiting;
+                     call check_control_flags() in each polling iteration
+                     so cancel/pause works even while a gate is blocking)
       4. On status="resumed": apply modified_files + option_overrides, continue
       5. On status="skipped": use default outputs, continue
       6. On run cancel: set status="skipped", continue teardown
 
-    Function boundaries supporting interrupt (spec §3.2):
-      Phase 1: db_build, query_execution, sarif_parsing,
-               fact_enrichment, spec_generation
-      Phase 2: source_exploration, spec_selection, driver_synthesis,
-               stub_synthesis, compile_diagnose, klee_execution,
-               harness_refinement
-      Phase 3: replay_driver_gen, asan_compilation, result_classification
+    Function boundaries (PipelineFunctionId values from shared/contracts):
+      Phase 1: phase1_codeql_build, phase1_codeql_analyze,
+               phase1_fact_enrichment, phase1_spec_generation
+      Phase 2: phase2_source_exploration, phase2_driver_synthesis,
+               phase2_stub_synthesis, phase2_klee_execution,
+               phase2_harness_refinement
+      Phase 3: phase3_asan_build, phase3_replay_execution
+
+    Total: 11 function IDs (not 15 or 12 — earlier counts were wrong).
+    The authoritative list is PipelineFunctionId in shared/contracts/sailor.schema.json.
+    If that enum adds or removes values, update this comment to match.
 
     Note: sailor/ pipeline code has NO knowledge of interrupt_points.
     Interrupt logic lives entirely in backend Celery tasks (Constraint 8).
@@ -789,8 +844,16 @@ CONSTRAINTS (non-negotiable):
 
 8. Auto/Manual mode must not be enforced inside sailor/ pipeline code.
    sailor/ always runs to completion when called.
-   Interrupt logic lives entirely in backend Celery tasks.
-   sailor/ pipeline code has no knowledge of interrupt_points.
+   Interrupt logic lives entirely in backend/tasks/_interrupt.py.
+   sailor/ pipeline code has no knowledge of interrupt_points or AutoConfig.
+
+   Concretely:
+   - The interrupt gate is called BEFORE each sailor/ function, not inside it.
+   - If the gate returns {skipped: True}, the task uses default outputs
+     (defined in CLAUDE_worker.md Gap W7 table) and does NOT call the
+     sailor/ function at all.
+   - If the gate returns normally (resumed), the task calls the sailor/
+     function with any option_overrides applied to its arguments.
 
 9. File validation runs server-side only.
    The /api/validate/file endpoint is the single validation point.

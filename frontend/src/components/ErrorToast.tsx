@@ -1,19 +1,5 @@
 import { useEffect, useState } from 'react'
-
-type ToastMessage = { id: number; message: string; type: 'error' | 'warning' }
-
-const listeners = new Set<(msg: ToastMessage) => void>()
-let nextId = 0
-
-export function showError(message: string) {
-  const msg: ToastMessage = { id: nextId++, message, type: 'error' }
-  listeners.forEach((fn) => fn(msg))
-}
-
-export function showWarning(message: string) {
-  const msg: ToastMessage = { id: nextId++, message, type: 'warning' }
-  listeners.forEach((fn) => fn(msg))
-}
+import { toastListeners, type ToastMessage } from '@/lib/toast'
 
 export function ErrorToastContainer() {
   const [toasts, setToasts] = useState<ToastMessage[]>([])
@@ -25,8 +11,8 @@ export function ErrorToastContainer() {
         setToasts((prev) => prev.filter((t) => t.id !== msg.id))
       }, 6000)
     }
-    listeners.add(handler)
-    return () => { listeners.delete(handler) }
+    toastListeners.add(handler)
+    return () => { toastListeners.delete(handler) }
   }, [])
 
   if (toasts.length === 0) return null

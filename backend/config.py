@@ -23,9 +23,12 @@ class Settings(BaseSettings):
     anthropic_api_option: str = "false"
     gemini_api_key: str = ""
 
+    debug_mode: bool = True
+
     class Config:
         env_file = ".env"
         case_sensitive = False
+        extra = "ignore"
 
 
 settings = Settings()

@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from config import settings
 from database import get_db
 from middleware.auth import get_current_user
 from models.user import User
@@ -14,6 +15,10 @@ from services.auth_service import (
     create_refresh_token,
     decode_token,
     hash_password,
+)
+from shared.contracts.sailor_models import (
+    RegisterRequest as SharedRegisterRequest,
+    RegisterResponse as SharedRegisterResponse,
 )
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -70,30 +75,21 @@ async def logout(user: User = Depends(get_current_user)) -> dict:
     return {"status": "ok"}
 
 
-class RegisterRequest(BaseModel):
-    username: str
-    email: str
-    password: str
-    display_name: str | None = None
-
-
-class RegisterResponse(BaseModel):
-    user_id: str
-    username: str
-    role: str
-
-
-@router.post("/register", response_model=RegisterResponse)
-async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)) -> RegisterResponse:
-    # Check username uniqueness
+@router.post("/register", response_model=SharedRegisterResponse)
+async def register(body: SharedRegisterRequest, db: AsyncSession = Depends(get_db)) -> SharedRegisterResponse:
+    """Register a new user. First registered user receives admin role."""
+    # Anti-enumeration: same error for duplicate username or email
     existing = await db.execute(select(User).where(User.username == body.username))
     if existing.scalar_one_or_none():
-        raise HTTPException(status_code=400, detail="Username already taken")
+        raise HTTPException(status_code=400, detail={"code": "username_taken", "message": "Username already registered"})
 
-    # First registered user gets admin role
-    count_result = await db.execute(select(User))
-    user_count = len(count_result.scalars().all())
-    role = "admin" if user_count == 0 else "viewer"
+    # DEBUG_MODE: all accounts get admin; otherwise only the first account does
+    if settings.debug_mode:
+        role = "admin"
+    else:
+        count_result = await db.execute(select(User))
+        user_count = len(count_result.scalars().all())
+        role = "admin" if user_count == 0 else "viewer"
 
     user = User(
         username=body.username,
@@ -103,7 +99,7 @@ async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)) ->
     db.add(user)
     await db.commit()
     await db.refresh(user)
-    return RegisterResponse(user_id=user.user_id, username=user.username, role=user.role)
+    return SharedRegisterResponse(user_id=user.user_id, username=user.username, role=user.role)  # type: ignore[arg-type]
 
 
 # User management endpoints (admin only)

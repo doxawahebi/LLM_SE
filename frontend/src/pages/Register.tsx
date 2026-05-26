@@ -32,7 +32,7 @@ export function Register() {
     form.email.includes("@") &&
     form.password.length >= 12 &&
     form.password === form.confirm &&
-    strengthScore >= 3;
+    strengthScore >= 2;
 
   async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
@@ -135,7 +135,7 @@ export function Register() {
                 </div>
                 <p className="text-xs text-muted-foreground">
                   {STRENGTH_LABELS[strengthScore]}
-                  {strengthScore < 3 && " — must reach Good"}
+                  {strengthScore < 2 && " — must reach Fair"}
                 </p>
               </div>
             )}

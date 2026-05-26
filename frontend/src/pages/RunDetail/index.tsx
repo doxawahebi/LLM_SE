@@ -1,11 +1,12 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { getRun } from "@/api/runs";
 import { listSpecs } from "@/api/specs";
 import { useRunStore } from "@/hooks/useRunStore";
 import { useSpecStore } from "@/hooks/useSpecStore";
-import { useSSE, type InterruptNotification } from "@/hooks/useSSE";
+import { useInterruptStore } from "@/hooks/useInterruptStore";
+import { useSSE } from "@/hooks/useSSE";
 import { RunHeader } from "./RunHeader";
 import { SpecTable } from "./SpecTable";
 import { ChartsStrip } from "./ChartsStrip";
@@ -13,6 +14,7 @@ import { RunResultsTab } from "./RunResultsTab";
 import { PipelineControlsSidebar } from "@/components/PipelineControlsSidebar";
 import { SSEStatusIndicator } from "@/components/SSEStatusIndicator";
 import { cn } from "@/lib/cn";
+import type { InterruptPoint } from "@/shared/contracts/sailor.types";
 
 type Tab = "specs" | "charts" | "results" | "logs" | "workers";
 
@@ -24,14 +26,28 @@ export function RunDetail() {
   const setRun = useRunStore((s) => s.setRun);
   const setSpecs = useSpecStore((s) => s.setSpecs);
   const run = useRunStore((s) => s.runs.get(run_id ?? ""));
-  const [interruptToast, setInterruptToast] = useState<InterruptNotification | null>(null);
+  const [interruptToast, setInterruptToast] = useState<InterruptPoint | null>(null);
   const [sseConnected, setSseConnected] = useState(false);
+  const seenInterruptIds = useRef(new Set<string>());
+  const hasMountedRef = useRef(false);
 
-  const handleInterrupt = useCallback((evt: InterruptNotification) => {
-    setInterruptToast(evt);
-    // auto-dismiss after 8s
-    setTimeout(() => setInterruptToast(null), 8000);
-  }, []);
+  const storeInterrupts = useInterruptStore((s) => s.interrupts);
+
+  useEffect(() => {
+    if (!hasMountedRef.current) {
+      // Seed with existing interrupts so we don't toast on initial load
+      hasMountedRef.current = true;
+      for (const id of storeInterrupts.keys()) seenInterruptIds.current.add(id);
+      return;
+    }
+    for (const [id, ip] of storeInterrupts) {
+      if (ip.run_id === run_id && ip.status === "waiting" && !seenInterruptIds.current.has(id)) {
+        seenInterruptIds.current.add(id);
+        setInterruptToast(ip);
+        setTimeout(() => setInterruptToast(null), 8000);
+      }
+    }
+  }, [storeInterrupts, run_id]);
 
   const handleSseConnect = useCallback(() => setSseConnected(true), []);
   const handleSseDisconnect = useCallback(() => setSseConnected(false), []);
@@ -40,7 +56,6 @@ export function RunDetail() {
   useSSE({
     topics: sseTopics,
     enabled: !!run_id,
-    onInterrupt: handleInterrupt,
     onConnect: handleSseConnect,
     onDisconnect: handleSseDisconnect,
   });

@@ -4,29 +4,26 @@ import { AutoCheckbox } from "./AutoCheckbox";
 import { getAutoConfig, patchAutoConfig } from "@/api/client";
 
 const PHASE1_FUNCTIONS: Array<[string, string]> = [
-  ["phase1.codeql_db_build", "CodeQL DB Build"],
-  ["phase1.query_execution", "Query Execution"],
-  ["phase1.sarif_parsing", "SARIF Parsing"],
-  ["phase1.fact_enrichment", "Fact Enrichment"],
-  ["phase1.spec_generation", "Spec Generation"],
+  ["phase1_db_build", "CodeQL DB Build"],
+  ["phase1_query_execution", "Query Execution"],
+  ["phase1_sarif_parsing", "SARIF Parsing"],
+  ["phase1_fact_enrichment", "Fact Enrichment"],
+  ["phase1_spec_generation", "Spec Generation"],
 ];
 
 const PHASE2_FUNCTIONS: Array<[string, string]> = [
-  ["phase2.source_exploration", "Source Exploration"],
-  ["phase2.driver_synthesis", "Driver Synthesis"],
-  ["phase2.stub_synthesis", "Stub Synthesis"],
-  ["phase2.assertion_instantiation", "Assertion Instantiation"],
-  ["phase2.compile_diagnose", "Compile & Diagnose"],
-  ["phase2.klee_execution", "KLEE Execution"],
-  ["phase2.harness_refinement", "Harness Refinement"],
-  ["phase2.llm_generation", "LLM Generation"],
+  ["phase2_spec_selection", "Spec Selection"],
+  ["phase2_source_exploration", "Source Exploration"],
+  ["phase2_driver_synthesis", "Driver Synthesis"],
+  ["phase2_stub_synthesis", "Stub Synthesis"],
+  ["phase2_compile_diagnose", "Compile & Diagnose"],
+  ["phase2_klee_execution", "KLEE Execution"],
 ];
 
 const PHASE3_FUNCTIONS: Array<[string, string]> = [
-  ["phase3.replay_driver_gen", "Replay Driver Generation"],
-  ["phase3.asan_compilation", "ASan Compilation"],
-  ["phase3.concrete_execution", "Concrete Execution"],
-  ["phase3.result_classification", "Result Classification"],
+  ["phase3_replay_driver_generation", "Replay Driver Generation"],
+  ["phase3_asan_compilation", "ASan Compilation"],
+  ["phase3_result_classification", "Result Classification"],
 ];
 
 interface Props {

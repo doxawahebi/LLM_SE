@@ -1,6 +1,6 @@
 import axios, { type AxiosInstance, type AxiosError } from "axios";
 import type { ApiError } from "@/lib/types";
-import { showError } from "@/components/ErrorToast";
+import { showError } from "@/lib/toast";
 
 export interface User {
   id: string;
@@ -46,7 +46,7 @@ apiClient.interceptors.response.use(
     const data = err.response?.data as Record<string, unknown> | undefined;
     const detail = (data?.detail as string) ?? (data?.message as string) ?? err.message;
 
-    if (status === 401) {
+    if (status === 401 && !err.config?.url?.includes("/api/auth/login")) {
       localStorage.removeItem("access_token");
       localStorage.removeItem("refresh_token");
       window.location.href = "/login";

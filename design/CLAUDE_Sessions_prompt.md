@@ -1187,3 +1187,221 @@ Step 9. Verify full stack in Docker.
 
 Step 10. Run Standard Last Step.
 ```
+
+---
+
+## Session 11 — Worker Implementation (Celery Tasks)
+
+**Trigger:** `Read CLAUDE.md and execute Session 11.`
+
+**Prerequisite:** Session 9 (Backend) must be complete.
+Verify: `curl http://localhost:8000/api/health` returns `{"status": "ok"}`.
+
+```
+Step 0. Read CLAUDE.md in full.
+        Read CLAUDE_Sessions_prompt.md in full.
+
+Step 1. Read spec/worker_spec.md in full.
+        Read design/CLAUDE_worker.md in full.
+        Read design/CLAUDE_backend.md §§ Gap 2–4 and Phase D.
+        Read design/CLAUDE_infra.md §§ File 1 (docker_runner.py) and
+          File 4 (Dockerfile.worker).
+        Read spec/interactive_control_spec.md §4 (interrupt gate contract).
+        Read spec/sse_contract.md §8 (event kinds and payload shapes).
+        Read shared/contracts/README.md (PipelineFunctionId enum values).
+        (CLAUDE_worker.md is the single implementation guide for this session.
+         CLAUDE_backend.md Phase D provides supplementary context only.
+         sse_contract.md is authoritative for all wire-level event details.)
+
+Step 2. Verify prerequisites.
+
+  2a. Schema completeness.
+      → All 14 shared types required by interactive_control_spec.md §12
+        must be present in shared/contracts/sailor.schema.json:
+          PipelineFunctionId, InterruptScope, InterruptStatus,
+          InterruptPoint, InterruptInputFile, InterruptResumeRequest,
+          InterruptSkipRequest, AutoConfig, AutoConfigPatch,
+          FileValidationResult, FileValidationSeverity,
+          InterruptCreatedPayload, InterruptResolvedPayload,
+          AutoConfigChangedPayload.
+      → If any are missing: run ./scripts/regen_contracts.sh first.
+        Do NOT proceed past Step 2 with incomplete shared types.
+
+  2b. Database models.
+      → Confirm ORM models exist in backend/models/:
+          interrupt_point.py  (InterruptPoint with status, input_files,
+                               option_overrides, modified_files columns)
+          auto_config.py      (AutoConfig JSONB per run_id)
+      → If missing: create them and generate + apply a migration before
+        writing any task code.
+      → Run: alembic upgrade head
+             pytest tests/ -v  (existing tests must still pass)
+
+  2c. Docker images.
+      → Verify docker/Dockerfile.runner builds:
+          docker build -f docker/Dockerfile.runner -t sailor-runner:latest .
+      → Verify docker/Dockerfile.worker builds:
+          docker build -f docker/Dockerfile.worker -t sailor-worker:latest .
+      → If either fails: fix the Dockerfile before continuing.
+
+Step 3. Implement Phase A — Shared Infrastructure.
+
+  A1. Lease management additions to services/spec_service.py.
+      → acquire_phase2_lease(), extend_lease(), drop_lease(), persist_turn()
+      → All use optimistic locking (UPDATE ... WHERE ... RETURNING id).
+      → Zero-row result = lease lost; caller raises CooperativeExit.
+
+  A2. backend/tasks/_control.py
+      → CooperativeExit exception class.
+      → check_control_flags(session, spec_id, run_id, worker_id, event_service).
+        Order: cancel → paused → intervention (process list in order).
+      → apply_intervention() dispatcher for all three intervention types.
+
+  A3. backend/tasks/_interrupt.py
+      → interrupt_gate(session, function_id, run_id, spec_id, worker_id,
+                       event_service, scope, input_files) → dict.
+      → Creates InterruptPoint row, publishes interrupt_created SSE.
+      → Polls every 2s; calls check_control_flags() in each iteration.
+      → Extends lease every 60s while waiting.
+      → Returns option_overrides and modified_file_refs on "resumed".
+      → Returns {skipped: True} on "skipped".
+
+  A4. run_counters_updated throttle in services/event_service.py.
+      → publish_counters_throttled(run_id, counters): max 1 publish/second.
+      → Deferred flush if suppressed (asyncio.call_later or asyncio.Task).
+
+  After A1–A4: pytest tests/test_tasks.py::test_interrupt_gate_* -v
+
+Step 4. Implement Phase B — phase1_task.
+
+  B1. backend/tasks/phase1.py
+      → Celery task with queue="phase1", acks_late=True,
+        reject_on_worker_lost=True.
+      → Idempotency guard: run.status != "queued" → return early.
+      → DockerRunner(cve_id=run_id, config=RunnerConfig()).
+      → 4 interrupt gates (phase1_codeql_build, phase1_codeql_analyze,
+        phase1_fact_enrichment, phase1_spec_generation).
+      → Default outputs on "skipped" per CLAUDE_worker.md §Gap W7 table.
+      → Spec ID: deterministic SHA-256(run_id + rule_id + file + line)[:32].
+      → INSERT spec ON CONFLICT DO NOTHING (idempotency).
+      → Publish: RunStarted → SpecEmitted/SpecFiltered per finding →
+        run_counters_updated (throttled) → enqueue phase2_task per spec.
+      → Failure: codeql_build_failure → run.status=failed, RunFailed SSE.
+      → runner.stop() in finally block (NON-NEGOTIABLE).
+
+  After B1: pytest tests/test_tasks.py::test_phase1_* -v
+
+Step 5. Implement Phase C — phase2_task.
+
+  C1. backend/tasks/phase2.py — implement in this order:
+      C1a. Lease acquisition + heartbeat loop (asyncio.Task, every 30s).
+      C1b. State rehydration from last Turn row.
+      C1c. Algorithm 1 main loop (T_max / T_explore / T_author budgets).
+      C1d. Interrupt gates: phase2_source_exploration, phase2_driver_synthesis,
+           phase2_stub_synthesis, phase2_klee_execution,
+           phase2_harness_refinement.
+      C1e. Turn persistence (atomic: Spec update + Turn insert in one txn).
+      C1f. Intervention application for all three types.
+
+  LLM retry: exponential backoff, base 2s, max 5 attempts, cap 60s.
+             Gemini 429 follows the same path (see CLAUDE_backend.md Gap 3).
+             After 5 failures: spec.phase2_status = "errored".
+
+  Celery config: soft_time_limit=18_000, time_limit=18_060.
+
+  After C1: pytest tests/test_tasks.py::test_phase2_* -v
+
+Step 6. Implement Phase D — phase3_task.
+
+  D1. backend/tasks/phase3.py
+      → Lease acquisition (same pattern as Phase 2, for phase3_status).
+      → 2 interrupt gates: phase3_asan_build, phase3_replay_execution.
+      → Load Phase 2 artifacts: driver.c, slice.c, witness .ktest.
+      → runner.build_asan_archive() → asan failure → errored.
+      → ReplayDriverGenerator().generate() → replace klee_make_symbolic
+        with memcpy of witness bytes.
+      → runner.compile_harness() → compile failure → errored.
+      → runner.run_asan_replay() → ResultClassifier().classify().
+      → Write: asan_report.txt, replay_driver.c, verified_bug.json
+        to artifact store.
+      → Verdict row: dedup_key = SHA-256(file + func + line)[:32].
+      → Update run.counters (unique_confirmed deduplicated by dedup_key).
+      → Call _check_run_completion(): if all specs terminal →
+        run.status=completed, publish RunCompleted SSE.
+      → runner.stop() in finally block.
+
+  After D1: pytest tests/test_tasks.py::test_phase3_* -v
+
+Step 7. Implement Phase E — Logging and Container Streaming.
+
+  E1. Log publication for long-running container steps.
+      → _stream_and_log(): background asyncio.Task reading docker logs
+        line-by-line during KLEE runs and ASan builds.
+      → Each line: write LogLine to DB + publish log_line SSE.
+      → Source tags: "klee" for KLEE, "clang" for compile, "asan" for ASan.
+      → All worker log.info/warning/error calls also write to DB via
+        a custom logging handler.
+
+  E2. Worker heartbeat (idle state).
+      → When no spec is leased: publish WorkerHeartbeat every 5s.
+      → Status="idle", current_spec_id=null.
+
+Step 8. Implement Phase F — Tests.
+
+  F1. tests/test_tasks.py
+      → Full test matrix per CLAUDE_worker.md Phase F.
+      → Mock DockerRunner and sailor/ calls via unittest.mock.patch.
+      → Use pytest-asyncio + in-memory PostgreSQL (or test DB from conftest).
+      → Every test runs in an isolated DB transaction (rollback on teardown).
+
+  F2. Run full test suite.
+      → pytest tests/ -v         (all backend + task tests)
+      → mypy backend/tasks/ backend/services/ --strict
+
+Step 9. Verify full stack in Docker.
+
+  9a. Build and start all services.
+      → docker compose up -d --build worker
+      → docker compose logs worker --tail=20  (must show "celery ready")
+
+  9b. Submit a test run using the e2e workspace target.
+      → curl -X POST http://localhost:8000/api/runs \
+             -F "name=cwe_122_test" \
+             -F "project_zip=@tests/e2e_workspace/cwe_122/target.c" \
+             -H "Authorization: Bearer <token>"
+      → curl http://localhost:8000/api/runs/<run_id>
+        Watch for status progression: queued → running → completed.
+
+  9c. Verify SSE event stream.
+      → curl -N "http://localhost:8000/api/events?topics=runs.<run_id>&token=<jwt>"
+        Events must appear (not silence). Expected kinds in order:
+          run_status_changed (running)
+          spec_state_changed (emitted) × N
+          run_counters_updated
+          turn_appended × per spec per turn
+          spec_state_changed (terminal) × N
+          run_status_changed (completed)
+
+  9d. Verify interrupt functionality.
+      This is NOT judged by clicks alone. All checks must be confirmed
+      in the backend state store (database), not only in the SSE stream.
+      → PATCH /api/runs/<run_id>/auto-config
+               {"phase2_klee_execution": false}
+      → Confirm interrupt_points row written with status="waiting".
+      → Confirm interrupt_created SSE event received.
+      → POST /api/runs/<run_id>/interrupts/<id>/skip
+      → Confirm interrupt_points row updated to status="skipped".
+      → Confirm interrupt_resolved SSE event received.
+      → Confirm spec resumes processing (turn_count_total increments in DB).
+
+  9e. Verify pause/resume/cancel propagate to workers.
+      → POST /api/runs/<run_id>/pause while run is in progress.
+      → Confirm: run.status=paused in DB within 1 turn cycle.
+      → Confirm: in-progress spec phase2_status=queued in DB.
+      → POST /api/runs/<run_id>/resume.
+      → Confirm: spec re-queued and processing resumes.
+      → POST /api/runs/<run_id>/cancel.
+      → Confirm: run.status=cancelled; specs not yet started → errored.
+
+Step 10. Run Standard Last Step.
+```

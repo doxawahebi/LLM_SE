@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,14 +28,24 @@ from typing import Any
 log = logging.getLogger("sailor.infra.docker_runner")
 
 
+def _default_network() -> str:
+    return os.environ.get("RUNNER_NETWORK", "sailor_net")
+
+
 @dataclass
 class RunnerConfig:
     """Configuration for a DockerRunner instance.
 
     Attributes:
         image: Docker image name for the runner container.
-        workspace_base: Host path used as the workspace volume root.
-        output_base: Host path used as the output volume root.
+        workspace_base: Container-side path for workspace files (worker view).
+        output_base: Container-side path for output files (worker view).
+        workspace_volume: Named Docker volume for workspace (used in runner mount).
+            When set, runner is started with ``-v <name>:/workspace`` instead of
+            a bind-mount from ``workspace_base``.  Required when the worker itself
+            runs inside Docker because the host path for named volumes is not
+            accessible via a bind-mount.
+        output_volume: Named Docker volume for output (used in runner mount).
         network: Docker network the runner container joins.
         cpu_limit: ``--cpus`` flag value for the container.
         memory_limit: ``--memory`` flag value for the container.
@@ -44,10 +55,14 @@ class RunnerConfig:
         asan_timeout: Seconds allowed for ASan reproducer execution.
     """
 
-    image: str = "sailor-runner:latest"
-    workspace_base: Path = field(default_factory=lambda: Path("/data/workspace"))
-    output_base: Path = field(default_factory=lambda: Path("/data/output"))
-    network: str = "sailor_net"
+    image: str = field(default_factory=lambda: os.environ.get("RUNNER_IMAGE", "sailor-runner:latest"))
+    workspace_base: Path = field(default_factory=lambda: Path(os.environ.get("WORKSPACE_BASE", "/data/workspace")))
+    output_base: Path = field(default_factory=lambda: Path(os.environ.get("OUTPUT_BASE", "/data/output")))
+    # Named volume names — set these when running inside Docker so the runner
+    # container shares the same named volumes instead of a host bind-mount.
+    workspace_volume: str = field(default_factory=lambda: os.environ.get("WORKSPACE_VOLUME", ""))
+    output_volume: str = field(default_factory=lambda: os.environ.get("OUTPUT_VOLUME", ""))
+    network: str = field(default_factory=_default_network)
     cpu_limit: str = "4"
     memory_limit: str = "8g"
     build_timeout: int = 1800
@@ -95,14 +110,26 @@ class DockerRunner:
         Raises:
             RuntimeError: If the ``docker run`` command fails.
         """
+        # Use named volume mounts when running inside Docker (worker context);
+        # fall back to bind-mounts for local execution.
+        ws_mount = (
+            f"{self.config.workspace_volume}:/workspace"
+            if self.config.workspace_volume
+            else f"{self.config.workspace_base}:/workspace"
+        )
+        out_mount = (
+            f"{self.config.output_volume}:/output"
+            if self.config.output_volume
+            else f"{self.config.output_base}:/output"
+        )
         cmd = [
             "docker", "run", "-d",
             "--name", f"sailor-runner-{self.cve_id}",
             "--network", self.config.network,
             "--cpus", self.config.cpu_limit,
             "--memory", self.config.memory_limit,
-            "-v", f"{self.config.workspace_base}:/workspace",
-            "-v", f"{self.config.output_base}:/output",
+            "-v", ws_mount,
+            "-v", out_mount,
             "-e", f"CVE_ID={self.cve_id}",
             self.config.image,
             "sleep", "infinity",
@@ -215,13 +242,20 @@ class DockerRunner:
 
     # ── Phase 1 ───────────────────────────────────────────────────────────
 
-    def run_phase1(self, project_dir: str, build_command: str) -> dict[str, Any]:
+    def run_phase1(
+        self,
+        project_dir: str,
+        build_command: str | None = None,
+        build_mode: str | None = None,
+    ) -> dict[str, Any]:
         """Build a CodeQL database and run the query suite inside the container.
 
         Args:
             project_dir: Absolute path to the project root *inside the container*.
-            build_command: The build command CodeQL should intercept (typically
-                ``make`` or the ``bear``-wrapped command).
+            build_command: The build command CodeQL should intercept (e.g. ``make``).
+                Mutually exclusive with *build_mode*.
+            build_mode: CodeQL build mode (e.g. ``autobuild``, ``manual``).
+                Used when no explicit *build_command* is provided.
 
         Returns:
             Parsed SARIF dict read from the shared output volume.
@@ -232,18 +266,46 @@ class DockerRunner:
         db_path = f"/workspace/{self.cve_id}/codeql_db"
         sarif_path = f"/output/{self.cve_id}/findings.sarif"
 
+        if build_command:
+            build_arg = f"--command='{build_command}'"
+        else:
+            mode = build_mode if build_mode and build_mode not in ("autodetect", "none", "") else "autobuild"
+            build_arg = f"--build-mode={mode}"
+
         self.exec(
             f"codeql database create {db_path} "
             f"--language=cpp "
-            f"--command='{build_command}' "
+            f"{build_arg} "
             f"--source-root={project_dir} "
             f"--overwrite",
             cwd=project_dir,
             timeout=self.config.codeql_timeout,
         )
+        # Write custom .ql queries to the shared workspace volume so the runner
+        # can access them at /workspace/{cve_id}/cql_queries/.
+        custom_queries_host = self.config.workspace_base / self.cve_id / "cql_queries"
+        custom_queries_container = f"/workspace/{self.cve_id}/cql_queries"
+        try:
+            from sailor.codeql.queries import CodeQLQuerySuite
+            suite = CodeQLQuerySuite()
+            suite.write_custom_queries(custom_queries_host)
+            log.info("[%s] Wrote %d custom queries to %s",
+                     self.cve_id, len(list(custom_queries_host.glob("*.ql"))), custom_queries_host)
+        except Exception as exc:
+            log.warning("[%s] Could not write custom queries: %s", self.cve_id, exc)
+            custom_queries_container = None
+
+        # Ensure output directory exists inside the container before analyze writes SARIF.
+        sarif_dir = f"/output/{self.cve_id}"
+        self.exec(f"mkdir -p {sarif_dir}")
+
+        # Use the built-in C++ security query suite plus our custom queries.
+        analyze_targets = "codeql/cpp-queries:codeql-suites/cpp-security-extended.qls"
+        if custom_queries_container:
+            analyze_targets += f" {custom_queries_container}"
         self.exec(
             f"codeql database analyze {db_path} "
-            f"/sailor-queries/ "
+            f"{analyze_targets} "
             f"--format=sarifv2.1.0 "
             f"--output={sarif_path}",
             timeout=self.config.codeql_timeout,
@@ -337,6 +399,9 @@ class DockerRunner:
         harness_bc = f"/workspace/{self.cve_id}/harness/harness.bc"
         klee_out = f"/workspace/{self.cve_id}/klee-out-{spec_id}"
 
+        # Remove stale output dir so KLEE doesn't fail with "File exists"
+        self.exec(f"rm -rf {klee_out}", check=False)
+
         result = self.exec(
             f"klee "
             f"--search=random-path --search=dfs "
@@ -351,22 +416,33 @@ class DockerRunner:
 
         stderr = result["stderr"]
 
-        real_error = (
-            "memory error" in stderr.lower()
-            or "invalid memory access" in stderr.lower()
-        )
-        sailor_assert = "SAILOR_SINK_REACHED" in stderr
-
         host_klee_out = (
             self.config.workspace_base / self.cve_id / f"klee-out-{spec_id}"
         )
         ktest_paths: list[str] = []
+        real_error_files: list[Path] = []
+        assert_err_files: list[Path] = []
         if host_klee_out.exists():
             ktest_paths = sorted(str(p) for p in host_klee_out.glob("*.ktest"))
+            # Check .err files directly — more reliable than parsing stderr text.
+            # ptr.err / free.err / null.err etc. = real memory safety errors (BUG_TRIGGERED)
+            # assert.err = reachability assertion fired (SITE_REACHED)
+            real_error_files = [
+                p for p in host_klee_out.glob("*.err")
+                if not p.name.endswith(".assert.err")
+            ]
+            assert_err_files = list(host_klee_out.glob("*.assert.err"))
 
-        if real_error and ktest_paths:
+        # Fallback: stderr-based detection (handles cases where volume path lags)
+        real_error_stderr = (
+            "memory error" in stderr.lower()
+            or "invalid memory access" in stderr.lower()
+        )
+        sailor_assert_stderr = "SAILOR_SINK_REACHED" in stderr
+
+        if (real_error_files or real_error_stderr) and ktest_paths:
             outcome = "bug_triggered"
-        elif sailor_assert and ktest_paths:
+        elif (assert_err_files or sailor_assert_stderr) and ktest_paths:
             outcome = "site_reached"
         else:
             outcome = "not_reached"
@@ -386,21 +462,41 @@ class DockerRunner:
 
     # ── Phase 3 ───────────────────────────────────────────────────────────
 
-    def build_asan_archive(self, project_dir: str, build_command: str) -> str:
+    def build_asan_archive(self, project_dir: str, build_command: str | None = None) -> str:
         """Rebuild the UNMODIFIED project with ASan inside the container.
 
         Packages all resulting ``.o`` files into a static archive.
 
         Args:
             project_dir: Absolute path to the project root *inside the container*.
-            build_command: Build command that produces object files.
+            build_command: Build command that produces object files.  When
+                ``None``, auto-detects: ``make`` if a Makefile is present,
+                ``cmake --build .`` if CMakeLists.txt is present.
 
         Returns:
             Absolute path (container-side) to the produced ``project_asan.a``
             archive.
         """
+        if build_command is None:
+            probe = self.exec(
+                f"test -f {project_dir}/Makefile && echo make "
+                f"|| (test -f {project_dir}/CMakeLists.txt && echo cmake) "
+                f"|| echo make",
+                check=False,
+            )
+            detected = (probe.get("stdout") or "make").strip().split("\n")[0].strip()
+            build_command = detected if detected else "make"
+
         asan_dir = f"/workspace/{self.cve_id}/asan-build"
         self.exec(f"mkdir -p {asan_dir}")
+
+        # Clean stale object files so make re-compiles with ASan flags
+        if build_command.startswith("make"):
+            self.exec(
+                f"{build_command} clean 2>/dev/null || true",
+                cwd=project_dir,
+                check=False,
+            )
 
         self.exec(
             f"CFLAGS='-fsanitize=address -O1 -g' "
@@ -422,13 +518,22 @@ class DockerRunner:
         replay_driver_c: str,
         asan_archive: str,
         include_paths: list[str],
+        project_dir: str | None = None,
     ) -> dict[str, Any]:
-        """Compile a replay driver against the ASan archive and execute it.
+        """Compile a replay driver against the project source and execute it.
+
+        When *project_dir* is provided (preferred), all project ``.c`` files are
+        compiled together with the replay driver in a single translation unit so
+        that ``static`` functions remain visible.  When *project_dir* is absent
+        the legacy archive-linking path is used.
 
         Args:
             replay_driver_c: C source of the replay driver.
-            asan_archive: Container-side path to the ASan-instrumented archive.
+            asan_archive: Container-side path to the ASan-instrumented archive
+                (used as fallback only).
             include_paths: ``-I<path>`` flags (as bare path strings).
+            project_dir: Absolute path inside the container to the project root
+                whose ``.c`` files should be compiled alongside the driver.
 
         Returns:
             Dict with keys:
@@ -436,38 +541,113 @@ class DockerRunner:
             - ``asan_output``: Combined stdout + stderr from the reproducer.
             - ``error`` (optional): ``"compile_failed"`` if compilation failed.
         """
+        import re
         import tempfile
 
         replay_dir = f"/workspace/{self.cve_id}/replay"
         self.exec(f"mkdir -p {replay_dir}")
 
-        # Write replay_driver.c via docker cp to avoid writing to a
-        # root-owned volume directory (same pattern as compile_harness).
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp = Path(tmpdir)
-            (tmp / "replay_driver.c").write_text(replay_driver_c, encoding="utf-8")
-            cp_result = self._local_run(
-                ["docker", "cp",
-                 f"{tmpdir}/.", f"{self.container_id}:{replay_dir}"],
+        if project_dir:
+            # ── Inline (single-TU) compilation ──────────────────────────────
+            # Find all project .c files; exclude any generated replay_driver.c
+            find_r = self.exec(
+                f"find {project_dir} -maxdepth 3 -name '*.c'"
+                f" -not -name 'replay_driver.c' 2>/dev/null",
                 check=False,
             )
-            if cp_result.returncode != 0:
-                return {
-                    "crashed": False,
-                    "asan_output": f"docker cp replay_driver failed: {cp_result.stderr}",
-                    "error": "compile_failed",
-                }
+            proj_c_files = sorted(
+                line.strip()
+                for line in find_r["stdout"].splitlines()
+                if line.strip()
+            )
 
-        includes = " ".join(f"-I{p}" for p in include_paths) if include_paths else ""
+            # Build a combined source: project files (main renamed) + replay driver
+            header_lines = [
+                "#include <string.h>",
+                "#include <stdlib.h>",
+                "#include <stddef.h>",
+            ]
+            proj_sections: list[str] = []
+            for i, cf in enumerate(proj_c_files):
+                cat_r = self.exec(f"cat {cf}", check=False)
+                content = cat_r["stdout"]
+                proj_sections.append(
+                    f"/* ==== {cf} ==== */\n"
+                    f"#define main __proj_main_{i}__\n"
+                    f"{content}\n"
+                    f"#undef main\n"
+                )
 
-        compile_r = self.exec(
-            f"clang -fsanitize=address -O1 -g "
-            f"{includes} "
-            f"{replay_dir}/replay_driver.c "
-            f"{asan_archive} "
-            f"-o {replay_dir}/reproducer",
-            check=False,
-        )
+            # Remove forward declarations from replay driver that would conflict
+            # with definitions now visible in the same TU.
+            replay_clean = re.sub(
+                r"^\s*(?:static\s+|extern\s+)?[a-zA-Z_][a-zA-Z0-9_ *]*\s+"
+                r"\w+\s*\([^)]*\)\s*;\s*$",
+                "",
+                replay_driver_c,
+                flags=re.MULTILINE,
+            )
+            # Remove duplicate standard includes from replay driver
+            replay_clean = re.sub(
+                r"#\s*include\s*[<\"](string|stdlib|stddef)\.h[>\"]\s*\n?",
+                "",
+                replay_clean,
+            )
+
+            combined = "\n".join(header_lines) + "\n" + "\n".join(proj_sections) + "\n" + replay_clean
+            combined_path = f"{replay_dir}/combined.c"
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                (tmp / "combined.c").write_text(combined, encoding="utf-8")
+                cp_result = self._local_run(
+                    ["docker", "cp",
+                     f"{tmpdir}/.", f"{self.container_id}:{replay_dir}"],
+                    check=False,
+                )
+                if cp_result.returncode != 0:
+                    return {
+                        "crashed": False,
+                        "asan_output": f"docker cp combined.c failed: {cp_result.stderr}",
+                        "error": "compile_failed",
+                    }
+
+            includes = " ".join(f"-I{p}" for p in include_paths) if include_paths else ""
+            compile_r = self.exec(
+                f"clang -fsanitize=address -O0 -g "
+                f"-fno-optimize-sibling-calls -fno-omit-frame-pointer "
+                f"{includes} "
+                f"{combined_path} "
+                f"-o {replay_dir}/reproducer",
+                check=False,
+            )
+        else:
+            # ── Legacy archive-linking path ──────────────────────────────────
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                (tmp / "replay_driver.c").write_text(replay_driver_c, encoding="utf-8")
+                cp_result = self._local_run(
+                    ["docker", "cp",
+                     f"{tmpdir}/.", f"{self.container_id}:{replay_dir}"],
+                    check=False,
+                )
+                if cp_result.returncode != 0:
+                    return {
+                        "crashed": False,
+                        "asan_output": f"docker cp replay_driver failed: {cp_result.stderr}",
+                        "error": "compile_failed",
+                    }
+
+            includes = " ".join(f"-I{p}" for p in include_paths) if include_paths else ""
+            compile_r = self.exec(
+                f"clang -fsanitize=address -O1 -g "
+                f"{includes} "
+                f"{replay_dir}/replay_driver.c "
+                f"{asan_archive} "
+                f"-o {replay_dir}/reproducer",
+                check=False,
+            )
+
         if compile_r["exit_code"] != 0:
             return {
                 "crashed": False,

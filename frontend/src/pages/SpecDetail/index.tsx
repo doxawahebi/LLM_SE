@@ -1,9 +1,10 @@
-import { useState, useCallback } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { getSpec } from "@/api/specs";
-import { useSSE, type InterruptNotification } from "@/hooks/useSSE";
+import { useSSE } from "@/hooks/useSSE";
 import { useSpecStore } from "@/hooks/useSpecStore";
+import { useInterruptStore } from "@/hooks/useInterruptStore";
 import { listInterrupts, type InterruptPoint } from "@/api/client";
 import { SpecHeader } from "./SpecHeader";
 import { Timeline } from "./Timeline";
@@ -27,19 +28,24 @@ export function SpecDetail() {
       data.filter((i: InterruptPoint) => i.spec_id === spec_id && i.status === "waiting"),
   });
 
-  const handleInterrupt = useCallback((evt: InterruptNotification) => {
-    // If this is the spec we're viewing, refetch interrupts and show panel
-    if (evt.spec_id === spec_id) {
+  // Refetch when a new interrupt for this spec appears in the store
+  const storeInterrupts = useInterruptStore((s) => s.interrupts);
+  const prevCountRef = useRef(0);
+  useEffect(() => {
+    const count = Array.from(storeInterrupts.values()).filter(
+      (ip) => ip.spec_id === spec_id && ip.status === "waiting"
+    ).length;
+    if (count !== prevCountRef.current) {
+      prevCountRef.current = count;
       void refetchInterrupts();
     }
-  }, [spec_id, refetchInterrupts]);
+  }, [storeInterrupts, spec_id, refetchInterrupts]);
 
   useSSE({
     topics: run_id && spec_id
       ? [`runs.${run_id}.specs.${spec_id}`]
       : [],
     enabled: !!(run_id && spec_id),
-    onInterrupt: handleInterrupt,
   });
 
   useQuery({

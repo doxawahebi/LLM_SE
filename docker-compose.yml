@@ -7,8 +7,8 @@ services:
   # ── Frontend ────────────────────────────────────────────────────────
   frontend:
     build:
-      context: ./frontend
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: frontend/Dockerfile
       target: ${FRONTEND_TARGET:-production}   # development | production
     ports:
       - "${FRONTEND_PORT:-3000}:80"
@@ -23,8 +23,8 @@ services:
   # ── Backend (FastAPI) ───────────────────────────────────────────────
   backend:
     build:
-      context: ./backend
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: backend/Dockerfile
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     environment:
@@ -68,8 +68,15 @@ services:
       ANTHROPIC_API_OPTION:  ${ANTHROPIC_API_OPTION:-false}
       GEMINI_API_KEY:        ${GEMINI_API_KEY}
       OUTPUT_BASE:           /data/output
+      WORKSPACE_BASE:        /data/workspace
       RUNNER_IMAGE:          sailor-runner:latest
-      RUNNER_NETWORK:        sailor_net
+      RUNNER_NETWORK:        se-llm-project_sailor_net
+      WORKSPACE_VOLUME:      se-llm-project_workspace_data
+      OUTPUT_VOLUME:         se-llm-project_output_data
+      S3_ENDPOINT:           http://minio:9000
+      S3_ACCESS_KEY:         ${MINIO_ROOT_USER}
+      S3_SECRET_KEY:         ${MINIO_ROOT_PASSWORD}
+      S3_BUCKET:             sailor-artifacts
     volumes:
       - workspace_data:/data/workspace
       - output_data:/data/output

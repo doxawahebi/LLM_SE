@@ -1,9 +1,12 @@
 """Spec service — CRUD and lease management."""
 
+import json
 import uuid
 from datetime import datetime, timedelta
+from typing import Any
 
 from sqlalchemy import select, update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.spec import Intervention, Spec
@@ -71,6 +74,79 @@ async def release_lease(db: AsyncSession, spec_id: str, worker_id: str) -> None:
         .values(worker_id=None, locked_until=None)
     )
     await db.commit()
+
+
+async def extend_lease_bool(db: AsyncSession, spec_id: str, worker_id: str) -> bool:
+    """Extend lease; returns False if lease was stolen (zero rows updated)."""
+    now = datetime.utcnow()
+    result = await db.execute(
+        update(Spec)
+        .where(Spec.spec_id == spec_id, Spec.worker_id == worker_id)
+        .values(locked_until=now + LEASE_DURATION)
+        .returning(Spec.spec_id)
+    )
+    await db.commit()
+    return result.scalar_one_or_none() is not None
+
+
+async def acquire_phase3_lease(db: AsyncSession, spec_id: str, worker_id: str) -> bool:
+    """Acquire Phase 3 lease; returns True if acquired."""
+    now = datetime.utcnow()
+    result = await db.execute(
+        update(Spec)
+        .where(
+            Spec.spec_id == spec_id,
+            (Spec.worker_id.is_(None)) | (Spec.locked_until < now),
+        )
+        .values(worker_id=worker_id, locked_until=now + LEASE_DURATION)
+        .returning(Spec.spec_id)
+    )
+    await db.commit()
+    return result.scalar_one_or_none() is not None
+
+
+async def drop_phase3_lease(db: AsyncSession, spec_id: str, worker_id: str) -> None:
+    """Drop Phase 3 lease."""
+    await release_lease(db, spec_id, worker_id)
+
+
+async def persist_turn(
+    db: AsyncSession,
+    spec_id: str,
+    worker_id: str,
+    turn_data: dict[str, Any],
+    spec_updates: dict[str, Any],
+) -> bool:
+    """Atomically update Spec counters and insert a Turn row.
+
+    Returns False if the lease was stolen (zero-row Spec update).
+    turn_data must contain all Turn columns except spec_id.
+    """
+    from models.turn import Turn
+
+    async with db.begin():
+        spec_result = await db.execute(
+            update(Spec)
+            .where(
+                Spec.spec_id == spec_id,
+                Spec.worker_id == worker_id,
+                Spec.locked_until > datetime.utcnow(),
+            )
+            .values(**spec_updates)
+            .returning(Spec.spec_id)
+        )
+        if spec_result.scalar_one_or_none() is None:
+            return False  # lease stolen
+
+        # Insert Turn; ON CONFLICT DO NOTHING for idempotency
+        stmt = (
+            insert(Turn)
+            .values(spec_id=spec_id, **turn_data)
+            .on_conflict_do_nothing(index_elements=["turn_id"])
+        )
+        await db.execute(stmt)
+
+    return True
 
 
 async def add_intervention(

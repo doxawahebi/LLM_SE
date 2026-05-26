@@ -130,7 +130,8 @@ async def requeue_spec(
     await db.execute(update(Spec).where(Spec.spec_id == spec_id).values(**values))
     await db.commit()
     await log_audit(db, "spec_requeue", actor=user.user_id, target=f"spec:{spec_id}")
-    # TODO: enqueue phase2_task(spec_id)
+    from tasks.phase2 import phase2_task
+    phase2_task.delay(spec_id)
     return {"spec_id": spec_id, "status": "queued"}
 
 
@@ -167,6 +168,9 @@ async def bulk_requeue(
         .values(phase2_status="queued")
     )
     await db.commit()
+    from tasks.phase2 import phase2_task
+    for sid in body.spec_ids:
+        phase2_task.delay(sid)
     return {"requeued": len(body.spec_ids)}
 
 

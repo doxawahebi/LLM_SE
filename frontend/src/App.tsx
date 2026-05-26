@@ -14,6 +14,8 @@ import { WorkerView }    from "./pages/WorkerView";
 import { LogsView }      from "./pages/LogsView";
 import { Settings }      from "./pages/Settings";
 import { UserManagement } from "./pages/UserManagement";
+import { InterruptList }  from "./pages/InterruptList";
+import { InterruptDetail } from "./pages/InterruptDetail";
 
 const qc = new QueryClient({
   defaultOptions: {
@@ -41,10 +43,12 @@ export default function App() {
               <Route element={<AppShell />}>
                 <Route path="/"                            element={<Dashboard />} />
                 <Route path="/runs/new"                    element={<NewRun />} />
-                <Route path="/runs/:run_id"                element={<RunDetail />} />
-                <Route path="/runs/:run_id/specs/:spec_id" element={<SpecDetail />} />
-                <Route path="/runs/:run_id/workers"        element={<WorkerView />} />
-                <Route path="/runs/:run_id/logs"           element={<LogsView />} />
+                <Route path="/runs/:run_id"                              element={<RunDetail />} />
+                <Route path="/runs/:run_id/specs/:spec_id"           element={<SpecDetail />} />
+                <Route path="/runs/:run_id/workers"                  element={<WorkerView />} />
+                <Route path="/runs/:run_id/logs"                     element={<LogsView />} />
+                <Route path="/runs/:run_id/interrupts"               element={<InterruptList />} />
+                <Route path="/runs/:run_id/interrupts/:interrupt_id" element={<InterruptDetail />} />
                 <Route path="/settings"                    element={<Settings />} />
                 <Route path="/settings/users"              element={<UserManagement />} />
               </Route>

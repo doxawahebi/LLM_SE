@@ -1,43 +1,27 @@
 """File validation endpoint — POST /api/validate/file (public, stateless)."""
 
-import base64
-
-from fastapi import APIRouter
-from pydantic import BaseModel
+from fastapi import APIRouter, File, Form, UploadFile
 
 from services.validation_service import get_validator_service
+from shared.contracts.sailor_models import FileValidationResult
 
 router = APIRouter(prefix="/api/validate", tags=["validate"])
 
 
-class ValidateFileRequest(BaseModel):
-    filename: str
-    content_base64: str
+@router.post("/file", response_model=FileValidationResult)
+async def validate_file(
+    file: UploadFile = File(...),
+    filename: str = Form(...),
+) -> FileValidationResult:
+    """Validate file structure.
 
+    Body: multipart/form-data
+      file     — binary file content
+      filename — logical filename including extension (drives validator dispatch)
 
-class ValidateFileResponse(BaseModel):
-    valid: bool
-    severity: str
-    message: str
-    detected_format: str
-
-
-@router.post("/file", response_model=ValidateFileResponse)
-async def validate_file(body: ValidateFileRequest) -> ValidateFileResponse:
-    try:
-        content_bytes = base64.b64decode(body.content_base64)
-    except Exception:
-        return ValidateFileResponse(
-            valid=False,
-            severity="error",
-            message="content_base64 is not valid base64.",
-            detected_format="unknown",
-        )
+    Always returns HTTP 200; check `severity` field for validation outcome.
+    ApiError is only returned for endpoint-level failures (auth, server error).
+    """
+    content_bytes = await file.read()
     svc = get_validator_service()
-    result = svc.validate(body.filename, content_bytes)
-    return ValidateFileResponse(
-        valid=result.valid,
-        severity=result.severity,
-        message=result.message,
-        detected_format=result.detected_format,
-    )
+    return svc.validate(filename, content_bytes)

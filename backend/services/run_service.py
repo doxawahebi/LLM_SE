@@ -1,13 +1,16 @@
 """Run service — CRUD and state transitions."""
 
+import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.run import Run
 from schemas.run import RunConfig
+
+logger = logging.getLogger("sailor.run_service")
 
 
 VALID_TRANSITIONS: dict[str, list[str]] = {
@@ -59,6 +62,7 @@ def _empty_counters() -> dict:
         "specs_phase3_queued": 0,
         "specs_phase3_confirmed": 0,
         "specs_phase3_rejected": 0,
+        "specs_phase3_errored": 0,
         "unique_confirmed": 0,
         "total_llm_tokens": 0,
         "total_klee_seconds": 0,
@@ -89,7 +93,45 @@ async def transition_run(
     )
     await db.commit()
     row = result.fetchone()
-    return row[0] if row else None
+    updated = row[0] if row else None
+
+    if updated:
+        await _publish_run_status_changed(run_id, new_status)
+
+    return updated
+
+
+async def _publish_run_status_changed(run_id: str, new_status: str) -> None:
+    """Publish run_status_changed SSE event. Connects Redis lazily (for Celery worker context)."""
+    try:
+        from services.event_service import get_event_service
+        from shared.contracts.sailor_models import (
+            RunStatus as ContractRunStatus,
+            RunStatusChangedPayload,
+            SSEMessageRunStatusChanged,
+        )
+
+        event_service = get_event_service()
+        if event_service._redis is None:
+            await event_service.connect()
+
+        await event_service.publish_message(
+            SSEMessageRunStatusChanged(
+                topic=f"runs.{run_id}",
+                sequence=0,
+                timestamp=datetime.now(timezone.utc),
+                kind="run_status_changed",
+                payload=RunStatusChangedPayload(
+                    run_id=run_id,
+                    status=ContractRunStatus(new_status),
+                ),
+            )
+        )
+    except Exception:
+        logger.warning(
+            "Failed to publish run_status_changed for run %s → %s",
+            run_id, new_status, exc_info=True,
+        )
 
 
 async def get_run(db: AsyncSession, run_id: str) -> Run | None:
