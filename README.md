@@ -207,7 +207,7 @@ This project was developed using **Claude Code** (Anthropic) as the primary AI e
         │  Implementation must match the design; conflicts are flagged.
         │
         ▼
-4. Sync check (ongoing)
+4. Sync check (ongoing) (unimplemented)
         │
         │  SYNC_CHECK rule in CLAUDE.md enforces ground truth hierarchy:
         │    paper/ > design/ > sailor/ code
